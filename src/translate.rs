@@ -1,10 +1,11 @@
-//! Translation into Japanese with PLaMo 3 Translate.
+//! Translation into Japanese with whichever model is selected.
 
-use crate::engine::{Device, Engine, SLOTS, URL};
+use crate::config;
+use crate::engine::{self, Device, Engine, SLOTS, URL};
+use crate::models::{self, Format};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -15,34 +16,54 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(120); // the larger models ta
 const CACHE_MAX: usize = 4096;
 const CHUNK_CHARS: usize = 240; // in one request, one paragraph per line
 const CONTEXT_CHARS: usize = 300;
+const CHAT_INSTRUCTION: &str = "Translate the user's text into natural Japanese. Keep one line of output for each line of input. Output only the translation.";
 
 pub struct Translator {
     agent: ureq::Agent,
     cache: Mutex<HashMap<String, String>>,
     engine: Option<Engine>,
+    running: Option<(String, Device)>,
 }
 
 impl Translator {
     pub fn new() -> Self {
         let config = ureq::Agent::config_builder().timeout_global(Some(TIMEOUT)).http_status_as_error(false).build();
-        Self { agent: config.into(), cache: Mutex::new(HashMap::new()), engine: None }
+        Self { agent: config.into(), cache: Mutex::new(HashMap::new()), engine: None, running: None }
     }
 
     fn ensure_engine(&mut self) -> Result<(), String> {
-        if !self.engine.as_mut().is_some_and(Engine::is_alive) {
-            self.engine = None; // first, so that the port is free again
-            let model = model_path();
-            if !model.exists() {
-                return Err(format!("モデルがありません: {}", model.display()));
-            }
-            self.engine = Some(Engine::start(&model, Device::Gpu)?);
+        let config = config::get();
+        let wanted = (config.model, config.device);
+        if self.engine.as_mut().is_some_and(Engine::is_alive) && self.running.as_ref() == Some(&wanted) {
+            return Ok(());
         }
+        self.engine = None; // first, so that the port is free again
+        let model = models::path(&wanted.0);
+        if !model.exists() {
+            return Err("モデルがありません。トレイのアイコンから設定を開いてダウンロードしてください".to_string());
+        }
+        if self.running.as_ref().is_some_and(|(file, _)| *file != wanted.0) {
+            self.cache.lock().unwrap().clear(); // another model, other translations
+        }
+        self.engine = Some(Engine::start(&model, wanted.1)?);
+        self.running = Some(wanted);
         Ok(())
     }
 
     /// Starts loading the model, about 3 seconds, without waiting for it: OCR can run meanwhile.
     pub fn warm_up(&mut self) {
-        let _ = self.ensure_engine();
+        if self.ensure_engine().is_ok() {
+            let agent = self.agent.clone();
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                while engine::STATE.load(Ordering::Relaxed) == engine::LOADING && start.elapsed() < LOAD_TIMEOUT {
+                    if is_loaded(&agent) {
+                        engine::STATE.store(engine::READY, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
     }
 
     /// Frees everything the translation holds, in both kinds of memory.
@@ -52,12 +73,7 @@ impl Translator {
 
     fn wait_until_loaded(&mut self) -> Result<(), String> {
         let start = Instant::now();
-        loop {
-            if let Ok(response) = self.agent.get(format!("{URL}/health")).call() {
-                if response.status() == 200 {
-                    return Ok(());
-                }
-            }
+        while !is_loaded(&self.agent) {
             if !self.engine.as_mut().is_some_and(Engine::is_alive) {
                 return Err("翻訳エンジンが止まりました".to_string());
             }
@@ -66,6 +82,8 @@ impl Translator {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        engine::STATE.store(engine::READY, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The translation, if it takes no request: the text needs none, or it was seen before.
@@ -87,6 +105,7 @@ impl Translator {
         self.ensure_engine()?;
         self.wait_until_loaded()?;
         let this = &*self;
+        let format = models::format_of(self.running.as_ref().map_or("", |(file, _)| file));
         let chunks = chunks(texts);
         let next = AtomicUsize::new(0);
         let failure = Mutex::new(None);
@@ -108,7 +127,7 @@ impl Translator {
                         // Neighbours in the same request give each other context; the ones
                         // just above come along as reference, since they run alongside.
                         let context = if i > 0 { tail(&chunks[i - 1].join(" ")) } else { String::new() };
-                        let ask = |text: &str, on_line: &mut dyn FnMut(&str)| this.ask(text, &context, keep_going, on_line);
+                        let ask = |text: &str, on_line: &mut dyn FnMut(&str)| this.ask(format, text, &context, keep_going, on_line);
                         if !keep_going() {
                             return;
                         }
@@ -123,21 +142,35 @@ impl Translator {
         failure.into_inner().unwrap().map_or(Ok(()), Err)
     }
 
+    /// Lets the model's own template turn the request into a prompt.
+    fn chat_prompt(&self, text: &str, context: &str) -> Result<String, String> {
+        let system = if context.is_empty() { CHAT_INSTRUCTION.to_string() } else { format!("{CHAT_INSTRUCTION}\nThe text comes after this: {context}") };
+        let body = json!({ "messages": [{ "role": "system", "content": system }, { "role": "user", "content": text }] });
+        let mut response = self
+            .agent
+            .post(format!("{URL}/apply-template"))
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .map_err(|e| e.to_string())?;
+        let reply = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
+        let reply: Value = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
+        reply["prompt"].as_str().map(str::to_string).ok_or_else(|| "このモデルは翻訳に使えません".to_string())
+    }
+
     /// Streams the translation, calling `on_line` as each line of it completes.
     fn ask(
         &self,
+        format: Format,
         text: &str,
         context: &str,
         keep_going: &impl Fn() -> bool,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), String> {
-        let body = json!({
-            "prompt": prompt(text, context),
-            "temperature": 0,
-            "n_predict": NUM_PREDICT,
-            "stop": ["<|plamo:tag|>", "<|plamo:bos|>"],
-            "stream": true,
-        });
+        let (prompt, stop) = match format {
+            Format::Plamo => (prompt(text, context), json!(["<|plamo:tag|>", "<|plamo:bos|>"])),
+            Format::Chat => (self.chat_prompt(text, context)?, json!([])),
+        };
+        let body = json!({ "prompt": prompt, "temperature": 0, "n_predict": NUM_PREDICT, "stop": stop, "stream": true });
         let mut response = self
             .agent
             .post(format!("{URL}/completion"))
@@ -230,13 +263,8 @@ fn translate_chunk(chunk: &[&str], ask: &Ask, done: &impl Fn(&str, &str)) -> Res
     Ok(())
 }
 
-/// Where the models live, one GGUF file each.
-pub fn models_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join("screen-translate\\models")
-}
-
-fn model_path() -> PathBuf {
-    models_dir().join("plamo-3-translate-2b-Q4_K_M.gguf")
+fn is_loaded(agent: &ureq::Agent) -> bool {
+    agent.get(format!("{URL}/health")).call().is_ok_and(|response| response.status() == 200)
 }
 
 fn needs_model(text: &str) -> bool {

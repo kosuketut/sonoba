@@ -8,6 +8,8 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::null;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
@@ -18,6 +20,21 @@ pub const SLOTS: usize = 4; // requests at once: twice the speed of one; eight a
 const CONTEXT_PER_SLOT: usize = 2048;
 const BATCH: &str = "1024";
 const HYBRID_LAYERS: &str = "12";
+
+pub const UNLOADED: u8 = 0;
+pub const LOADING: u8 = 1;
+pub const READY: u8 = 2;
+pub static STATE: AtomicU8 = AtomicU8::new(UNLOADED);
+
+/// Blocks until the engine has let go of its model file.
+pub fn wait_until_stopped() {
+    for _ in 0..250 {
+        if STATE.load(Ordering::Relaxed) == UNLOADED {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Device {
@@ -92,6 +109,7 @@ impl Engine {
             AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE);
             job as isize
         };
+        STATE.store(LOADING, Ordering::Relaxed);
         Ok(Self { child, job })
     }
 
@@ -104,5 +122,6 @@ impl Drop for Engine {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.job as HANDLE) };
         let _ = self.child.wait();
+        STATE.store(UNLOADED, Ordering::Relaxed);
     }
 }

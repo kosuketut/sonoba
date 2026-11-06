@@ -7,9 +7,12 @@
 #![windows_subsystem = "windows"]
 
 mod capture;
+mod config;
 mod engine;
+mod models;
 mod ocr;
 mod patch;
+mod settings;
 mod translate;
 
 use patch::{KEY_COLOR, Patch};
@@ -49,6 +52,8 @@ const WM_PATCHES: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const WM_JOB_OVER: u32 = WM_APP + 3;
 const MENU_EXIT: usize = 1;
+const MENU_SETTINGS: usize = 2;
+const HK_PROBE: i32 = 5;
 
 const DIM_ALPHA: u8 = 110;
 const HOVER_FRAME: i32 = 4;
@@ -86,8 +91,19 @@ static JOB: Mutex<Option<Job>> = Mutex::new(None);
 static WAKE: Condvar = Condvar::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static WARM_UP: AtomicBool = AtomicBool::new(false);
+static UNLOAD: AtomicBool = AtomicBool::new(false);
 static MOVED_AT: Mutex<Option<Instant>> = Mutex::new(None); // the last time the anchor window moved
 static PAUSED: AtomicBool = AtomicBool::new(false); // the anchor window is minimised
+
+pub fn request_load() {
+    WARM_UP.store(true, Ordering::Relaxed);
+    WAKE.notify_all();
+}
+
+pub fn request_unload() {
+    UNLOAD.store(true, Ordering::Relaxed);
+    WAKE.notify_all();
+}
 
 fn set_job(job: Option<Job>) {
     *JOB.lock().unwrap() = job;
@@ -125,7 +141,7 @@ fn worker(overlay: usize) {
     let mut idle_since = Instant::now();
     loop {
         let mut job = JOB.lock().unwrap();
-        while job.is_none() && !WARM_UP.swap(false, Ordering::Relaxed) {
+        while job.is_none() && !WARM_UP.load(Ordering::Relaxed) && !UNLOAD.load(Ordering::Relaxed) {
             let (guard, wait) = WAKE.wait_timeout(job, OCR_IDLE).unwrap();
             job = guard;
             if wait.timed_out() {
@@ -137,8 +153,13 @@ fn worker(overlay: usize) {
         match current {
             Some(job) => run(job, &mut models, &mut translator, overlay),
             None => {
-                models = models.or_else(|| ocr::Ocr::new().ok());
-                translator.warm_up();
+                if UNLOAD.swap(false, Ordering::Relaxed) {
+                    translator.unload();
+                }
+                if WARM_UP.swap(false, Ordering::Relaxed) {
+                    models = models.or_else(|| ocr::Ocr::new().ok());
+                    translator.warm_up();
+                }
             }
         }
         idle_since = Instant::now();
@@ -146,6 +167,12 @@ fn worker(overlay: usize) {
 }
 
 fn free_when_idle(since: Instant, models: &mut Option<ocr::Ocr>, translator: &mut translate::Translator) {
+    if UNLOAD.swap(false, Ordering::Relaxed) {
+        translator.unload();
+    }
+    if WARM_UP.swap(false, Ordering::Relaxed) {
+        translator.warm_up();
+    }
     if since.elapsed() >= OCR_IDLE {
         *models = None;
     }
@@ -477,8 +504,7 @@ unsafe fn begin_select(live: bool) {
             return;
         }
         stop();
-        WARM_UP.store(true, Ordering::Relaxed); // ready by the time the drag ends
-        WAKE.notify_one();
+        request_load(); // ready by the time the drag ends
         ui.live_next.set(live);
         let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
         let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
@@ -862,14 +888,19 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
 unsafe fn tray_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("設定"));
         AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("終了"));
         let mut at = POINT { x: 0, y: 0 };
         GetCursorPos(&mut at);
         SetForegroundWindow(hwnd); // Windows only dismisses a tray menu properly this way
         let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, at.x, at.y, 0, hwnd, null());
         DestroyMenu(menu);
-        if chosen as usize == MENU_EXIT {
-            DestroyWindow(hwnd);
+        match chosen as usize {
+            MENU_SETTINGS => settings::open(),
+            MENU_EXIT => {
+                DestroyWindow(hwnd);
+            }
+            _ => {}
         }
     }
 }
@@ -882,7 +913,7 @@ unsafe fn tray_icon(hwnd: HWND, action: u32) {
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
         data.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
-        let tip = wide("画面翻訳\nCtrl+Alt+T 1回 / R リアルタイム / X 消す\n2度押しで同じ範囲、クリックで窓全体");
+        let tip = wide("screen-translate\nダブルクリックで設定を開きます");
         data.szTip[..tip.len()].copy_from_slice(&tip);
         Shell_NotifyIconW(action, &data);
     }
@@ -906,8 +937,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 0
             }
             WM_TRAY => {
-                if l as u32 == WM_RBUTTONUP {
-                    tray_menu(hwnd);
+                match l as u32 {
+                    WM_RBUTTONUP => tray_menu(hwnd),
+                    WM_LBUTTONDBLCLK => settings::open(),
+                    _ => {}
                 }
                 0
             }
@@ -918,6 +951,39 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             }
             _ => DefWindowProcW(hwnd, msg, w, l),
         }
+    }
+}
+
+/// Registers the saved hotkeys. Returns false if another app holds one of them.
+fn register_hotkeys() -> bool {
+    let main = UI.with(|ui| ui.main.get());
+    let hotkeys = config::get().hotkeys;
+    let mut all = true;
+    for (id, hotkey) in [HK_ONCE, HK_LIVE, HK_STOP].into_iter().zip(hotkeys) {
+        all &= unsafe { RegisterHotKey(main, id, hotkey.mods | MOD_NOREPEAT, hotkey.key) } != 0;
+    }
+    all
+}
+
+/// The settings window needs the keys in use, to let them be typed into its boxes.
+pub fn pause_hotkeys() {
+    let main = UI.with(|ui| ui.main.get());
+    for id in [HK_ONCE, HK_LIVE, HK_STOP] {
+        unsafe { UnregisterHotKey(main, id) };
+    }
+}
+
+pub fn resume_hotkeys() {
+    register_hotkeys();
+}
+
+/// True if the key combination is free for the taking.
+pub fn try_hotkeys(hotkey: config::Hotkey) -> bool {
+    let main = UI.with(|ui| ui.main.get());
+    unsafe {
+        let free = RegisterHotKey(main, HK_PROBE, hotkey.mods, hotkey.key) != 0;
+        UnregisterHotKey(main, HK_PROBE);
+        free
     }
 }
 
@@ -964,22 +1030,24 @@ fn main() {
             ui.overlay.set(overlay);
         });
 
-        let mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
-        for (id, key) in [(HK_ONCE, 'T'), (HK_LIVE, 'R'), (HK_STOP, 'X')] {
-            if RegisterHotKey(main, id, mods, key as u32) == 0 {
-                let text = wide(&format!("Ctrl+Alt+{key} を登録できません。すでに起動しているか、別のアプリが使っています。\0"));
-                MessageBoxW(null_mut(), text.as_ptr(), w!("screen-translate"), MB_OK | MB_ICONERROR);
-                return;
-            }
-        }
         tray_icon(main, NIM_ADD);
+        settings::register_class();
+        if !register_hotkeys() {
+            // Two copies, or a key some other app took: either way the settings are the way out.
+            MessageBoxW(null_mut(), w!("ホットキーを登録できません。すでに起動しているか、別のアプリが使っています。"), w!("screen-translate"), MB_OK | MB_ICONWARNING);
+            settings::open();
+        }
 
         let overlay_handle = overlay as usize;
         std::thread::spawn(move || worker(overlay_handle));
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            DispatchMessageW(&msg);
+            let settings = settings::window();
+            if settings.is_null() || IsDialogMessageW(settings, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 }
