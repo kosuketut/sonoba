@@ -15,16 +15,17 @@ mod patch;
 mod settings;
 mod translate;
 
-use patch::{KEY_COLOR, Patch};
+use patch::{KEY_COLOR, Patch, WOBBLE_PERCENT};
 use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -37,9 +38,11 @@ const WATCH: Duration = Duration::from_millis(100); // one-shot results, which t
 const PARTIAL_EVERY: Duration = Duration::from_millis(30); // repaints while a page fills in
 const MOVE_SETTLE: Duration = Duration::from_millis(120); // no frames are judged until a drag pauses
 const STALE_PERCENT: usize = 8; // of the pixels: a scrolled page, not a hover highlight or a caret
-const PATCH_STALE_PERCENT: usize = 2; // of a patch's pixels, in live mode
 const OCR_IDLE: Duration = Duration::from_secs(60); // free the OCR models this long after the last job
 const ENGINE_IDLE: Duration = Duration::from_secs(15 * 60); // and the model after this long
+const MAX_REST: Duration = Duration::from_millis(500); // the longest pause between frames that keep coming
+const READING_SLIP: usize = 2; // letters OCR may read differently from one frame to the next
+const SAME_PLACE_PX: i32 = 3; // a patch this close to the last one with the same text is the same patch
 const MIN_SELECTION: i32 = 8;
 const MIN_TEXT_PX: i32 = 9; // below this Japanese stops being legible; the patch grows instead
 const STATUS_PX: i32 = 16;
@@ -51,6 +54,13 @@ const HK_ESC: i32 = 4;
 const WM_PATCHES: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const WM_JOB_OVER: u32 = WM_APP + 3;
+const WM_TRANSLATED: u32 = WM_APP + 4;
+const FLASH_TIMER: usize = 1;
+const FLASH_MS: u32 = 450;
+const FRAME_PX: i32 = 2;
+const FLASH_PX: i32 = 4;
+const FRAME_COLOR: u32 = 0x0071CC2E; // green, as COLORREF
+const FLASH_COLOR: u32 = 0x0088FF39;
 const MENU_EXIT: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const HK_PROBE: i32 = 5;
@@ -94,6 +104,7 @@ static WARM_UP: AtomicBool = AtomicBool::new(false);
 static UNLOAD: AtomicBool = AtomicBool::new(false);
 static MOVED_AT: Mutex<Option<Instant>> = Mutex::new(None); // the last time the anchor window moved
 static PAUSED: AtomicBool = AtomicBool::new(false); // the anchor window is minimised
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 pub fn request_load() {
     WARM_UP.store(true, Ordering::Relaxed);
@@ -130,9 +141,10 @@ struct Frame {
 struct Shared {
     frame: Mutex<Option<Frame>>, // the newest change, until the worker takes it
     fresh: Condvar,
-    version: AtomicU64, // counts the changes, so that work on an old frame can give up
-    done: AtomicBool,   // the current frame's translation is on show
+    obsolete: AtomicBool, // the text being translated has left the screen
+    done: AtomicBool,     // the current frame's translation is on show
     shown: Mutex<(Vec<u8>, Vec<Patch>)>, // what is on show, and the pixels it was made from
+    working: Mutex<(Vec<u8>, Vec<Patch>)>, // the same for the text being translated
 }
 
 fn worker(overlay: usize) {
@@ -141,7 +153,8 @@ fn worker(overlay: usize) {
     let mut idle_since = Instant::now();
     loop {
         let mut job = JOB.lock().unwrap();
-        while job.is_none() && !WARM_UP.load(Ordering::Relaxed) && !UNLOAD.load(Ordering::Relaxed) {
+        let requested = || WARM_UP.load(Ordering::Relaxed) || UNLOAD.load(Ordering::Relaxed) || engine::STATE.load(Ordering::Relaxed) == engine::LOADING;
+        while job.is_none() && !requested() {
             let (guard, wait) = WAKE.wait_timeout(job, OCR_IDLE).unwrap();
             job = guard;
             if wait.timed_out() {
@@ -152,15 +165,7 @@ fn worker(overlay: usize) {
         drop(job);
         match current {
             Some(job) => run(job, &mut models, &mut translator, overlay),
-            None => {
-                if UNLOAD.swap(false, Ordering::Relaxed) {
-                    translator.unload();
-                }
-                if WARM_UP.swap(false, Ordering::Relaxed) {
-                    let _ = ensure_ocr(&mut models);
-                    translator.warm_up();
-                }
-            }
+            None => serve_requests(&mut models, &mut translator, &|| JOB.lock().unwrap().is_none()),
         }
         idle_since = Instant::now();
     }
@@ -175,13 +180,20 @@ fn ensure_ocr(models: &mut Option<ocr::Ocr>) -> Result<(), String> {
     Ok(())
 }
 
-fn free_when_idle(since: Instant, models: &mut Option<ocr::Ocr>, translator: &mut translate::Translator) {
+/// Does what the settings window asked for. A load gives way once `keep_going` turns false, and
+/// comes back here to finish, so that the state on show is never left at "loading".
+fn serve_requests(models: &mut Option<ocr::Ocr>, translator: &mut translate::Translator, keep_going: &impl Fn() -> bool) {
     if UNLOAD.swap(false, Ordering::Relaxed) {
         translator.unload();
     }
-    if WARM_UP.swap(false, Ordering::Relaxed) {
-        translator.warm_up();
+    if WARM_UP.swap(false, Ordering::Relaxed) || engine::STATE.load(Ordering::Relaxed) == engine::LOADING {
+        let _ = ensure_ocr(models);
+        translator.warm_up(&|| keep_going() && !UNLOAD.load(Ordering::Relaxed));
     }
+}
+
+fn free_when_idle(since: Instant, models: &mut Option<ocr::Ocr>, translator: &mut translate::Translator) {
+    translator.drop_dead_engine();
     if since.elapsed() >= OCR_IDLE {
         *models = None;
     }
@@ -190,14 +202,19 @@ fn free_when_idle(since: Instant, models: &mut Option<ocr::Ocr>, translator: &mu
     }
 }
 
-fn run(job: Job, models: &mut Option<ocr::Ocr>, translator: &mut translate::Translator, overlay: usize) {
-    let shared = Shared {
+fn new_shared() -> Shared {
+    Shared {
         frame: Mutex::new(None),
         fresh: Condvar::new(),
-        version: AtomicU64::new(0),
+        obsolete: AtomicBool::new(false),
         done: AtomicBool::new(false),
         shown: Mutex::new((Vec::new(), Vec::new())),
-    };
+        working: Mutex::new((Vec::new(), Vec::new())),
+    }
+}
+
+fn run(job: Job, models: &mut Option<ocr::Ocr>, translator: &mut translate::Translator, overlay: usize) {
+    let shared = new_shared();
     std::thread::scope(|scope| {
         scope.spawn(|| watch(job, overlay, &shared));
         translate_frames(job, models, translator, overlay, &shared);
@@ -214,36 +231,87 @@ fn translate_frames(job: Job, models: &mut Option<ocr::Ocr>, translator: &mut tr
     let post = |patches: Vec<Patch>| post_patches(overlay, job.id, patches);
     let mut idle_since = Instant::now();
     loop {
-        let mut pending = shared.frame.lock().unwrap();
         let frame = loop {
             if !is_current(job.id) {
                 return;
             }
+            let (mut pending, _) = shared.fresh.wait_timeout_while(shared.frame.lock().unwrap(), POLL * 3, |frame| frame.is_none()).unwrap();
             if let Some(frame) = pending.take() {
                 break frame;
             }
-            pending = shared.fresh.wait_timeout(pending, POLL * 3).unwrap().0;
+            drop(pending); // a load takes a while, and the watcher needs this
+            serve_requests(models, translator, &|| is_current(job.id));
             free_when_idle(idle_since, models, translator); // a one-shot result can stay up for hours
         };
-        let version = shared.version.load(Ordering::Relaxed);
-        drop(pending);
+        shared.obsolete.store(false, Ordering::Relaxed);
 
-        let keep_going = || is_current(job.id) && shared.version.load(Ordering::Relaxed) == version;
-        let result = translate_frame(&frame, job.live, models, translator, &keep_going, &post);
-        let patches = result.unwrap_or_else(|e| vec![Patch::status(&format!("エラー: {e}"), frame.w as i32)]);
+        let start = Instant::now();
+        // Not "has the screen changed": behind a subtitle, a video changes it all the time.
+        let keep_going = || is_current(job.id) && !shared.obsolete.load(Ordering::Relaxed);
+        let result = translate_frame(&frame, job.live, models, translator, &keep_going, &post, shared);
+        let mut patches = result.unwrap_or_else(|e| vec![Patch::status(&format!("エラー: {e}"), frame.w as i32)]);
         if keep_going() {
-            *shared.shown.lock().unwrap() = (frame.pixels, patches.clone());
+            let mut shown = shared.shown.lock().unwrap();
+            hold_still(&mut patches, &shown, &frame);
+            let changed = patches != shown.1;
+            *shown = (frame.pixels, patches.clone());
+            drop(shown);
             shared.done.store(true, Ordering::Relaxed);
             post(patches);
+            if changed {
+                unsafe { PostMessageW(overlay as HWND, WM_TRANSLATED, job.id as usize, 0) };
+            }
+        }
+        // A video in the region changes every frame: this keeps OCR to half of one's time,
+        // until the text in it changes.
+        let rest = start.elapsed().min(MAX_REST);
+        if shared.frame.lock().unwrap().is_some() {
+            let resting = Instant::now();
+            while resting.elapsed() < rest && !shared.obsolete.load(Ordering::Relaxed) {
+                std::thread::sleep(POLL / 3);
+            }
         }
         idle_since = Instant::now();
     }
+}
+
+/// Two readings of one line: all but a letter or two around a part they share.
+fn same_reading(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let start = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let end = a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count();
+    start + end + READING_SLIP >= a.len().max(b.len())
+}
+
+/// OCR of a moving picture wobbles: a box moves by a pixel or two, a letter reads differently, a
+/// line goes unread for a frame. Text that stayed keeps its old patch.
+// shortcut: one letter changing in over fifty counts as wobble; a window into the text would tell.
+fn hold_still(patches: &mut Vec<Patch>, (basis, shown): &(Vec<u8>, Vec<Patch>), frame: &Frame) {
+    let unchanged = |old: &Patch| basis.len() == frame.pixels.len() && old.changed_percent(&frame.pixels, basis, frame.w) <= WOBBLE_PERCENT;
+    for patch in patches.iter_mut() {
+        let near = |a: i32, b: i32| (a - b).abs() <= SAME_PLACE_PX;
+        let same = shown.iter().find(|old| {
+            let place = near(old.x, patch.x) && near(old.y, patch.y) && near(old.w, patch.w) && near(old.h, patch.h);
+            (old.text == patch.text && place) || (old.overlaps(patch) && same_reading(&old.source, &patch.source) && unchanged(old))
+        });
+        if let Some(old) = same {
+            *patch = old.clone();
+        }
+    }
+    let unread = shown.iter().filter(|old| !old.source.is_empty() && unchanged(old) && !patches.iter().any(|p| p.overlaps(old)));
+    let unread: Vec<Patch> = unread.cloned().collect();
+    patches.extend(unread);
+    patches.sort_by_key(|p| (p.y, p.x)); // what comes and goes must not look like a change
 }
 
 /// Hands changed frames to the worker. Live, every change counts, and text whose pixels have
 /// changed comes off straight away. One-shot, the job ends once most of the page has changed.
 fn watch(job: Job, overlay: usize, shared: &Shared) {
     let post = |patches: Vec<Patch>| post_patches(overlay, job.id, patches);
+    // Never OCR our own output. The last watcher may have just lifted this, and what was on show
+    // takes a frame or two to leave the screen.
+    unsafe { SetWindowDisplayAffinity(overlay as HWND, WDA_EXCLUDEFROMCAPTURE) };
+    std::thread::sleep(POLL * 2);
     let finish = || unsafe {
         set_job(None);
         PostMessageW(overlay as HWND, WM_JOB_OVER, job.id as usize, 0);
@@ -253,17 +321,22 @@ fn watch(job: Job, overlay: usize, shared: &Shared) {
     let mut last: Vec<u8> = Vec::new();
     while let Some(current) = current_job(job.id) {
         let Region { x, y, w, h } = current.region;
+        if w <= 0 || h <= 0 {
+            std::thread::sleep(WATCH); // the window is off every screen for now
+            continue;
+        }
         if (w, h) != size {
             grabber = capture::Grabber::new(w, h);
             size = (w, h);
             last.clear();
             shared.done.store(false, Ordering::Relaxed);
+            shared.obsolete.store(true, Ordering::Relaxed);
         }
         let Some(grabber) = &grabber else {
             post(vec![Patch::status("画面を取得できません", w)]);
             return finish();
         };
-        if current.window != 0 && unsafe { IsWindow(current.window as HWND) } == 0 {
+        if current.window != 0 && window_is_gone(current.window as HWND) {
             return finish();
         }
         let moving = MOVED_AT.lock().unwrap().is_some_and(|at| at.elapsed() < MOVE_SETTLE);
@@ -283,11 +356,11 @@ fn watch(job: Job, overlay: usize, shared: &Shared) {
                 if job.live || first {
                     if job.live {
                         drop_stale_patches(frame, w as usize, shared, &post);
+                        give_up_on_stale_work(frame, w as usize, shared);
                     }
                     last.clear();
                     last.extend_from_slice(frame);
                     *shared.frame.lock().unwrap() = Some(Frame { pixels: last.clone(), w: w as usize, h: h as usize });
-                    shared.version.fetch_add(1, Ordering::Relaxed);
                     shared.fresh.notify_one();
                 } else if changed_pixels(frame, &last) * 100 > last.len() / 4 * STALE_PERCENT {
                     return finish();
@@ -295,6 +368,15 @@ fn watch(job: Job, overlay: usize, shared: &Shared) {
             }
         }
         std::thread::sleep(if job.live || last.is_empty() { POLL } else { WATCH });
+    }
+}
+
+/// Closed, hidden, or on another virtual desktop, which is what a cloaked window is.
+fn window_is_gone(window: HWND) -> bool {
+    unsafe {
+        let mut cloaked: u32 = 0;
+        DwmGetWindowAttribute(window, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as *mut _, 4);
+        IsWindow(window) == 0 || (IsWindowVisible(window) == 0 && IsIconic(window) == 0) || cloaked != 0
     }
 }
 
@@ -308,17 +390,20 @@ fn drop_stale_patches(frame: &[u8], width: usize, shared: &Shared, post: &impl F
         return;
     }
     let before = patches.len();
-    patches.retain(|p| {
-        let (x, w) = (p.x as usize * 4, p.w as usize * 4);
-        let rows = p.y as usize..((p.y + p.h) as usize).min(frame.len() / 4 / width);
-        let row = |pixels: &'_ [u8], y: usize| -> Vec<u8> {
-            pixels[y * width * 4..][..width * 4][x.min(width * 4)..(x + w).min(width * 4)].to_vec()
-        };
-        let changed: usize = rows.map(|y| changed_pixels(&row(frame, y), &row(basis, y))).sum();
-        changed * 100 <= (p.w * p.h) as usize * PATCH_STALE_PERCENT
-    });
+    patches.retain(|p| !p.is_stale(frame, basis, width));
     if patches.len() != before {
         post(patches.clone());
+    }
+}
+
+/// Translating a page that has gone would only paint its text over the next one.
+fn give_up_on_stale_work(frame: &[u8], width: usize, shared: &Shared) {
+    let (basis, patches) = &*shared.working.lock().unwrap();
+    if basis.len() == frame.len() {
+        let stale = patches.iter().filter(|p| p.is_stale(frame, basis, width)).count();
+        if stale * 2 > patches.len() {
+            shared.obsolete.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -329,6 +414,7 @@ fn translate_frame(
     translator: &mut translate::Translator,
     keep_going: &(impl Fn() -> bool + Sync),
     post: &(impl Fn(Vec<Patch>) + Sync),
+    shared: &Shared,
 ) -> Result<Vec<Patch>, String> {
     ensure_ocr(models)?;
     let Frame { pixels, w, h } = frame;
@@ -337,6 +423,8 @@ fn translate_frame(
     let lines = models.as_ref().unwrap().read(frame, w, h)?;
     let blocks = ocr::paragraphs(&lines);
     let blocks: Vec<&ocr::Block> = blocks.iter().filter(|b| !ocr::looks_like_code(&b.text)).collect();
+    let everything = blocks.iter().map(|block| Patch::new(frame, w, h, block, String::new())).collect();
+    *shared.working.lock().unwrap() = (frame.to_vec(), everything);
     // Numbers, code and the like come back unchanged: leave the original on show.
     let patch = |block: &ocr::Block, text: &str| {
         (text.to_lowercase() != block.text.to_lowercase()).then(|| Patch::new(frame, w, h, block, text.to_string()))
@@ -352,7 +440,7 @@ fn translate_frame(
         }
     }
     let shared = Mutex::new((slots, Instant::now()));
-    translator.translate_all(&pending, keep_going, &|source, translation| {
+    let result = translator.translate_all(&pending, keep_going, &|source, translation| {
         let (slots, last_post) = &mut *shared.lock().unwrap();
         for (slot, block) in slots.iter_mut().zip(&blocks) {
             if block.text == source {
@@ -363,9 +451,12 @@ fn translate_frame(
             *last_post = Instant::now();
             post(slots.iter().flatten().cloned().collect());
         }
-    })?;
+    });
     let mut out: Vec<Patch> = shared.into_inner().unwrap().0.into_iter().flatten().collect();
-    if out.is_empty() && !live {
+    // What did finish stays on show: one failed reply is no reason to lose the page.
+    if let Err(e) = result {
+        out.push(Patch::status(&format!("エラー: {e}"), w as i32));
+    } else if out.is_empty() && !live {
         out.push(Patch::status(NOT_FOUND, w as i32));
     }
     Ok(out)
@@ -376,6 +467,8 @@ fn translate_frame(
 struct Ui {
     main: Cell<HWND>,
     overlay: Cell<HWND>,
+    frame: Cell<HWND>,
+    flashing: Cell<bool>,
     select: Cell<HWND>,
     live_next: Cell<bool>, // the selection in progress starts a live job
     drag_from: Cell<Option<(i32, i32)>>,
@@ -394,6 +487,8 @@ thread_local! {
     static UI: Ui = Ui {
         main: Cell::new(null_mut()),
         overlay: Cell::new(null_mut()),
+        frame: Cell::new(null_mut()),
+        flashing: Cell::new(false),
         select: Cell::new(null_mut()),
         live_next: Cell::new(false),
         drag_from: Cell::new(None),
@@ -417,16 +512,73 @@ fn lparam_xy(l: LPARAM) -> (i32, i32) {
     ((l & 0xFFFF) as u16 as i16 as i32, ((l >> 16) & 0xFFFF) as u16 as i16 as i32)
 }
 
+/// The model leaves memory, and a job that is running would only load it again.
+pub fn unload_now() {
+    stop();
+    request_unload();
+}
+
 fn stop() {
     set_job(None);
     UI.with(|ui| unsafe {
         ui.live.set(false);
         ui.job_id.set(0);
+        ui.flashing.set(false);
         ShowWindow(ui.overlay.get(), SW_HIDE);
+        ShowWindow(ui.frame.get(), SW_HIDE);
         if !ui.hook.get().is_null() {
             UnhookWinEvent(ui.hook.replace(null_mut()));
         }
     });
+}
+
+/// Shows the frame around the region, or hides it, as the job and the settings have it.
+pub fn update_frame() {
+    UI.with(|ui| unsafe {
+        let frame = ui.frame.get();
+        let config = config::get();
+        let flashing = ui.flashing.get();
+        let wanted = ui.job_id.get() != 0 && !PAUSED.load(Ordering::Relaxed) && (config.show_frame || flashing);
+        let region = ui.region.get();
+        if !wanted || region.w <= 0 || region.h <= 0 {
+            ShowWindow(frame, SW_HIDE);
+            return;
+        }
+        let t = (if flashing { FLASH_PX } else { FRAME_PX }) * GetDpiForWindow(frame) as i32 / 96;
+        SetWindowPos(frame, HWND_TOPMOST, region.x - t, region.y - t, region.w + t * 2, region.h + t * 2, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(frame, null(), 0);
+    });
+}
+
+unsafe fn paint_frame(hwnd: HWND) {
+    unsafe {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut r: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut r);
+        let flashing = UI.with(|ui| ui.flashing.get());
+        let t = (if flashing { FLASH_PX } else { FRAME_PX }) * GetDpiForWindow(hwnd) as i32 / 96;
+        let color = if flashing { FLASH_COLOR } else { FRAME_COLOR };
+        fill(hdc, &r, KEY_COLOR);
+        fill(hdc, &RECT { bottom: t, ..r }, color);
+        fill(hdc, &RECT { top: r.bottom - t, ..r }, color);
+        fill(hdc, &RECT { right: t, ..r }, color);
+        fill(hdc, &RECT { left: r.right - t, ..r }, color);
+        EndPaint(hwnd, &ps);
+    }
+}
+
+unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_PAINT => {
+                paint_frame(hwnd);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
 }
 
 fn frame_bounds(window: HWND) -> Option<RECT> {
@@ -472,6 +624,7 @@ unsafe extern "system" fn on_location(_: HWINEVENTHOOK, _: u32, window: HWND, ob
         PAUSED.store(minimised, Ordering::Relaxed);
         if minimised {
             ShowWindow(overlay, SW_HIDE);
+            update_frame();
             return;
         }
         let old = ui.region.get();
@@ -493,6 +646,7 @@ unsafe extern "system" fn on_location(_: HWINEVENTHOOK, _: u32, window: HWND, ob
         if !ui.patches.borrow().is_empty() {
             ShowWindow(overlay, SW_SHOWNOACTIVATE);
         }
+        update_frame();
     });
 }
 
@@ -504,13 +658,14 @@ unsafe fn begin_select(live: bool) {
             // The hotkey again, instead of a drag: the same region as last time.
             end_select();
             let region = ui.region.get();
+            // The window may have gone since: what is left is the place on the screen.
+            ui.anchor.set(ui.anchor.get().filter(|a| !window_is_gone(a.window) && IsIconic(a.window) == 0));
             let followed = ui.anchor.get().and_then(|anchor| anchored_region(anchor, region));
             if region.w > 0 {
                 start_job(followed.unwrap_or(region), live);
             }
             return;
         }
-        stop();
         request_load(); // ready by the time the drag ends
         ui.live_next.set(live);
         let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
@@ -649,9 +804,9 @@ fn start_job(region: Region, live: bool) {
             let thread = GetWindowThreadProcessId(anchor.window, &mut process);
             ui.hook.set(SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, null_mut(), Some(on_location), process, thread, WINEVENT_OUTOFCONTEXT));
         }
-        SetWindowDisplayAffinity(ui.overlay.get(), WDA_EXCLUDEFROMCAPTURE); // never OCR our own output
         show_patches(vec![Patch::status(WORKING, region.w)]);
         set_job(Some(Job { region, live, id, window: anchor.map_or(0, |a| a.window as usize) }));
+        update_frame();
     });
 }
 
@@ -712,7 +867,8 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 finish_select(hwnd);
                 0
             }
-            WM_RBUTTONDOWN => {
+            // On the way up: the layer gone, the release would open the menu of the app below.
+            WM_RBUTTONUP => {
                 end_select();
                 0
             }
@@ -805,7 +961,9 @@ fn show_patches(mut patches: Vec<Patch>) {
         let text = patches.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
         SetWindowTextW(overlay, wide(&format!("{text}\0")).as_ptr()); // keeps it readable by screen readers
         *ui.patches.borrow_mut() = patches;
-        SetWindowPos(overlay, HWND_TOPMOST, region.x, region.y, region.w, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // Behind a minimised window the result waits for it to come back.
+        let show = if PAUSED.load(Ordering::Relaxed) { 0 } else { SWP_SHOWWINDOW };
+        SetWindowPos(overlay, HWND_TOPMOST, region.x, region.y, region.w, height, SWP_NOACTIVATE | show);
         InvalidateRect(overlay, null(), 0);
     });
 }
@@ -874,14 +1032,20 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 }
                 0
             }
+            WM_TRANSLATED => {
+                if UI.with(|ui| ui.job_id.get()) == w as u64 && config::get().flash_frame {
+                    UI.with(|ui| {
+                        ui.flashing.set(true);
+                        SetTimer(ui.main.get(), FLASH_TIMER, FLASH_MS, None);
+                    });
+                    update_frame();
+                }
+                0
+            }
             WM_PATCHES => {
                 let patches = Box::from_raw(l as *mut Vec<Patch>);
-                if UI.with(|ui| ui.job_id.get()) == w as u64 && !PAUSED.load(Ordering::Relaxed) {
+                if UI.with(|ui| ui.job_id.get()) == w as u64 {
                     show_patches(*patches);
-                    if !UI.with(|ui| ui.live.get()) {
-                        // One shot has read the screen already, so screenshots may show the result.
-                        SetWindowDisplayAffinity(hwnd, WDA_NONE);
-                    }
                 }
                 0
             }
@@ -932,7 +1096,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             WM_HOTKEY => {
                 match w as i32 {
                     HK_ONCE => begin_select(false),
-                    HK_LIVE if UI.with(|ui| ui.live.get()) => stop(),
+                    HK_LIVE if UI.with(|ui| ui.live.get() && ui.select.get().is_null()) => stop(),
                     HK_LIVE => begin_select(true),
                     HK_STOP => {
                         end_select();
@@ -941,6 +1105,16 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     HK_ESC => end_select(),
                     _ => {}
                 }
+                0
+            }
+            WM_TIMER if w == FLASH_TIMER => {
+                KillTimer(hwnd, FLASH_TIMER);
+                UI.with(|ui| ui.flashing.set(false));
+                update_frame();
+                0
+            }
+            WM_DISPLAYCHANGE => {
+                stop(); // the region may no longer be where it was
                 0
             }
             WM_TRAY => {
@@ -954,6 +1128,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             WM_DESTROY => {
                 tray_icon(hwnd, NIM_DELETE);
                 PostQuitMessage(0);
+                0
+            }
+            // Explorer restarted and lost every tray icon.
+            _ if msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+                tray_icon(hwnd, NIM_ADD);
                 0
             }
             _ => DefWindowProcW(hwnd, msg, w, l),
@@ -1006,12 +1185,47 @@ unsafe fn register_class(name: *const u16, proc: WNDPROC, cursor: *const u16) {
     }
 }
 
+/// Release builds abort on a panic and have no console, so this is the only trace one leaves.
+fn log_panics() {
+    let path = models::dir().parent().map(|dir| dir.join("crash.log"));
+    std::panic::set_hook(Box::new(move |info| {
+        let Some(path) = &path else { return };
+        let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            use std::io::Write;
+            let _ = writeln!(file, "{when}: {info}");
+        }
+    }));
+}
+
+/// A second start opens the settings of the first, which is usually what was wanted.
+fn already_running() -> bool {
+    unsafe {
+        CreateMutexW(null(), 0, w!("screen-translate.single-instance"));
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return false;
+        }
+        let first = FindWindowW(w!("ScreenTranslateMain"), null());
+        PostMessageW(first, WM_TRAY, 0, WM_LBUTTONDBLCLK as isize);
+        true
+    }
+}
+
 fn main() {
+    log_panics();
+    if already_running() {
+        return;
+    }
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         register_class(w!("ScreenTranslateMain"), Some(main_proc), IDC_ARROW);
         register_class(w!("ScreenTranslateSelect"), Some(select_proc), IDC_CROSS);
         register_class(w!("ScreenTranslateOverlay"), Some(overlay_proc), IDC_ARROW);
+        register_class(w!("ScreenTranslateFrame"), Some(frame_proc), IDC_ARROW);
+        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
 
         let module = GetModuleHandleW(null());
         let main = CreateWindowExW(0, w!("ScreenTranslateMain"), w!("screen-translate"), 0, 0, 0, 0, 0, null_mut(), null_mut(), module, null());
@@ -1030,16 +1244,34 @@ fn main() {
             null(),
         );
         SetLayeredWindowAttributes(overlay, KEY_COLOR, 255, LWA_COLORKEY);
+        let frame = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            w!("ScreenTranslateFrame"),
+            null(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            null_mut(),
+            null_mut(),
+            module,
+            null(),
+        );
+        SetLayeredWindowAttributes(frame, KEY_COLOR, 255, LWA_COLORKEY);
         UI.with(|ui| {
             ui.main.set(main);
             ui.overlay.set(overlay);
+            ui.frame.set(frame);
         });
 
         tray_icon(main, NIM_ADD);
         settings::register_class();
-        if !register_hotkeys() {
-            // Two copies, or a key some other app took: either way the settings are the way out.
-            MessageBoxW(null_mut(), w!("ホットキーを登録できません。すでに起動しているか、別のアプリが使っています。"), w!("screen-translate"), MB_OK | MB_ICONWARNING);
+        let hotkeys_ok = register_hotkeys();
+        if !hotkeys_ok {
+            MessageBoxW(null_mut(), w!("ホットキーを登録できません。別のアプリが使っています。設定で変更してください。"), w!("screen-translate"), MB_OK | MB_ICONWARNING);
+        }
+        if !hotkeys_ok || !models::is_present(&config::get().model) {
             settings::open();
         }
 
@@ -1061,6 +1293,63 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn readings_that_differ_by_a_letter_are_one_reading() {
+        assert!(same_reading("the guardian before dawn", "the quardian before dawn"));
+        assert!(same_reading("answer shape", "answer shape."));
+        assert!(!same_reading("You must defeat the guardian", "The bank was muddy"));
+    }
+
+    fn page(columns: &[usize]) -> Vec<u8> {
+        let (mut pixels, width) = (vec![255u8; 100 * 20 * 4], 100);
+        for y in 5..15 {
+            for x in columns {
+                pixels[(y * width + x) * 4..][..3].copy_from_slice(&[0, 0, 0]);
+            }
+        }
+        pixels
+    }
+
+    fn shown_patch(source: &str, text: &str) -> Patch {
+        Patch { x: 0, y: 0, w: 100, h: 20, text: text.to_string(), source: source.to_string(), ..Patch::status("", 100) }
+    }
+
+    #[test]
+    fn a_letter_read_differently_keeps_the_translation_until_the_pixels_change() {
+        let columns: Vec<usize> = (10..90).step_by(6).collect();
+        let shown = (page(&columns), vec![shown_patch("guardian", "守護者")]);
+        let still = Frame { pixels: shown.0.clone(), w: 100, h: 20 };
+        let mut patches = vec![shown_patch("quardian", "クァルディアン")];
+        hold_still(&mut patches, &shown, &still);
+        assert_eq!(patches[0].text, "守護者");
+
+        let changed = Frame { pixels: page(&columns[..8]), w: 100, h: 20 };
+        let mut patches = vec![shown_patch("guardians", "守護者たち")];
+        hold_still(&mut patches, &shown, &changed);
+        assert_eq!(patches[0].text, "守護者たち");
+    }
+
+    #[test]
+    fn a_line_unread_for_a_frame_stays_until_its_pixels_go() {
+        let columns: Vec<usize> = (10..90).step_by(6).collect();
+        let shown = (page(&columns), vec![shown_patch("guardian", "守護者")]);
+        let mut patches = Vec::new();
+        hold_still(&mut patches, &shown, &Frame { pixels: shown.0.clone(), w: 100, h: 20 });
+        assert_eq!(patches.len(), 1);
+
+        let mut patches = Vec::new();
+        hold_still(&mut patches, &shown, &Frame { pixels: page(&[]), w: 100, h: 20 });
+        assert!(patches.is_empty());
+    }
+
+    #[test]
+    fn a_status_message_is_not_held() {
+        let shown = (page(&[]), vec![Patch::status("エラー", 100)]);
+        let mut patches = Vec::new();
+        hold_still(&mut patches, &shown, &Frame { pixels: shown.0.clone(), w: 100, h: 20 });
+        assert!(patches.is_empty());
+    }
+
     /// Draws the overlay onto a picture, to judge a layout without touching the real screen:
     /// RENDER_IN=in.png RENDER_OUT=out.png cargo test render_picture -- --ignored --nocapture
     #[test]
@@ -1074,11 +1363,12 @@ mod tests {
         let frame = Frame { pixels: bgra.clone(), w, h };
         let (mut models, mut translator) = (None, translate::Translator::new());
         let keep_going = || true;
+        let shared = new_shared();
         let start = Instant::now();
-        let mut patches = translate_frame(&frame, false, &mut models, &mut translator, &keep_going, &|_| {}).unwrap();
+        let mut patches = translate_frame(&frame, false, &mut models, &mut translator, &keep_going, &|_| {}, &shared).unwrap();
         println!("first pass {:?}", start.elapsed());
         let start = Instant::now();
-        translate_frame(&frame, false, &mut models, &mut translator, &keep_going, &|_| {}).unwrap();
+        translate_frame(&frame, false, &mut models, &mut translator, &keep_going, &|_| {}, &shared).unwrap();
         println!("second pass, translations cached {:?}", start.elapsed());
         unsafe {
             let mem = CreateCompatibleDC(null_mut());

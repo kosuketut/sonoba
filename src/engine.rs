@@ -5,20 +5,20 @@
 
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::null;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::SystemInformation::{
     GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-pub const URL: &str = "http://127.0.0.1:11437";
-const PORT: &str = "11437";
 pub const SLOTS: usize = 4; // requests at once: twice the speed of one; eight add little
 const CONTEXT_PER_SLOT: usize = 2048;
 const BATCH: &str = "1024";
@@ -117,14 +117,27 @@ fn engine_command(device: Device) -> Result<Command, String> {
     Ok(command)
 }
 
+/// Puts a child process in a job that ends with the app, however the app ends.
+pub fn tie_to_app(child: &Child) {
+    static JOB: OnceLock<isize> = OnceLock::new();
+    let job = *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(null(), null());
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits as *const _ as *const _, size);
+        job as isize
+    });
+    unsafe { AssignProcessToJobObject(job as HANDLE, child.as_raw_handle() as HANDLE) };
+}
+
 pub struct Engine {
     child: Child,
-    job: isize,
+    pub url: String,
 }
 
 impl Engine {
-    /// Starts loading; `ready` tells when it has finished. The job object takes the process
-    /// down with the app, however the app ends.
+    /// Starts loading, on a port that is free right now.
     pub fn start(model: &Path, options: Options) -> Result<Self, String> {
         let device = options.device;
         let layers = match device {
@@ -141,10 +154,11 @@ impl Engine {
             });
             command.args(["--fit-target", &gpu_margin_mib(options.gpu_limit_mib, free).to_string()]);
         }
+        let port = TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map_err(|e| e.to_string())?.port();
         let child = command
             .arg("--model")
             .arg(model)
-            .args(["--host", "127.0.0.1", "--port", PORT, "--no-webui", "--offline", "--log-disable"])
+            .args(["--host", "127.0.0.1", "--port", &port.to_string(), "--no-webui", "--offline", "--log-disable"])
             .args(["-c", &(SLOTS * CONTEXT_PER_SLOT).to_string(), "-np", &SLOTS.to_string()])
             .args(["-b", BATCH, "-ub", BATCH, "-t", &options.threads.to_string(), "-ngl", layers])
             .args(["--cache-ram", "0", "--load-mode", "none"]) // no mapping: a third of the memory
@@ -154,17 +168,9 @@ impl Engine {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("翻訳エンジンを起動できません: {e}"))?;
-        let job = unsafe {
-            let job = CreateJobObjectW(null(), null());
-            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let size = size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
-            SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits as *const _ as *const _, size);
-            AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE);
-            job as isize
-        };
+        tie_to_app(&child);
         STATE.store(LOADING, Ordering::Relaxed);
-        Ok(Self { child, job })
+        Ok(Self { child, url: format!("http://127.0.0.1:{port}") })
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -200,7 +206,7 @@ mod tests {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        unsafe { CloseHandle(self.job as HANDLE) };
+        let _ = self.child.kill();
         let _ = self.child.wait();
         STATE.store(UNLOADED, Ordering::Relaxed);
     }

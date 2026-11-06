@@ -67,12 +67,27 @@ pub fn is_present(file: &str) -> bool {
     path(file).exists()
 }
 
+fn part(file: &str) -> PathBuf {
+    path(&format!("{file}.part"))
+}
+
+/// A download that stopped half way, which the next one picks up.
+pub fn has_part(file: &str) -> bool {
+    part(file).exists()
+}
+
 pub fn can_download(file: &str) -> bool {
     CATALOG.iter().any(|(size, _)| catalog_file(size) == file)
 }
 
 pub fn delete(file: &str) -> std::io::Result<()> {
-    std::fs::remove_file(path(file))
+    if has_part(file) {
+        std::fs::remove_file(part(file))?;
+    }
+    if is_present(file) {
+        std::fs::remove_file(path(file))?;
+    }
+    Ok(())
 }
 
 fn tool(name: &str) -> Command {
@@ -104,10 +119,11 @@ fn download(file: &str) -> Result<(), String> {
     let repo = format!("pfnet/plamo-3-translate-{size}-GGUF");
     let (total, hash) = expected(&repo, file)?;
     std::fs::create_dir_all(dir()).map_err(|e| e.to_string())?;
-    let part = path(&format!("{file}.part")); // kept when cancelled, and picked up again by -C -
+    let part = part(file); // kept when cancelled, and picked up again by -C -
     let url = format!("{SOURCE}/{repo}/resolve/main/{file}");
     if std::fs::metadata(&part).map_or(0, |m| m.len()) < total {
         let mut curl = tool("curl").args(["-sSfL", "-C", "-", "-o"]).arg(&part).arg(&url).stdout(Stdio::null()).spawn().map_err(|e| e.to_string())?;
+        crate::engine::tie_to_app(&curl);
         loop {
             if let Some(status) = curl.try_wait().map_err(|e| e.to_string())? {
                 if !status.success() {

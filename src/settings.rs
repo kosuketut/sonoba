@@ -27,6 +27,8 @@ const ID_CLOSE: i32 = 109;
 const ID_HOTKEY: i32 = 110; // and the two after it
 const ID_GPU_LIMIT: i32 = 113;
 const ID_THREADS: i32 = 114;
+const ID_SHOW_FRAME: i32 = 115;
+const ID_FLASH_FRAME: i32 = 116;
 const TIMER: usize = 1;
 const TIMER_MS: u32 = 250;
 const HOTKEY_LABELS: [&str; 3] = ["範囲を 1 回翻訳", "リアルタイム翻訳", "訳文を消す"];
@@ -113,7 +115,12 @@ fn fill_models(window: HWND) {
         for entry in &entries {
             SendMessageW(combo, CB_ADDSTRING, 0, wide(&entry.label).as_ptr() as isize);
         }
-        let index = entries.iter().position(|e| e.file == current).unwrap_or(0);
+        let index = entries.iter().position(|e| e.file == current).unwrap_or_else(|| {
+            // The file has gone, so the choice goes with it.
+            let index = entries.iter().position(|e| e.file == models::DEFAULT).unwrap_or(0);
+            config::update(|c| c.model = entries[index].file.clone());
+            index
+        });
         SendMessageW(combo, CB_SETCURSEL, index, 0);
     }
     ENTRIES.set(entries);
@@ -123,11 +130,13 @@ fn fill_models(window: HWND) {
 fn refresh(window: HWND) {
     let Some(file) = selected_file(window) else { return };
     let present = models::is_present(&file);
+    let partial = models::has_part(&file);
     let progress = models::PROGRESS.load(Ordering::Relaxed);
     let state = engine::STATE.load(Ordering::Relaxed);
     let status = match progress {
         models::VERIFYING => "ダウンロードしたファイルを確認しています".to_string(),
         0.. => format!("ダウンロード中 {progress}%"),
+        _ if !present && partial => "途中までダウンロードしてあります（続きから再開できます）".to_string(),
         _ if !present => "ダウンロードされていません".to_string(),
         _ if state == engine::READY => "読み込み済み（すぐ翻訳できます）".to_string(),
         _ if state == engine::LOADING => "読み込み中…".to_string(),
@@ -139,8 +148,8 @@ fn refresh(window: HWND) {
     }
     let downloading = progress >= 0;
     set_text(window, ID_DOWNLOAD, if downloading { "中止" } else { "ダウンロード" });
-    enable(window, ID_DOWNLOAD, downloading || (!present && models::can_download(&file)));
-    enable(window, ID_DELETE, present && !downloading);
+    enable(window, ID_DOWNLOAD, (downloading && progress != models::VERIFYING) || (!downloading && !present && models::can_download(&file)));
+    enable(window, ID_DELETE, (present || partial) && !downloading);
     enable(window, ID_LOAD, present && !downloading && state == engine::UNLOADED);
     enable(window, ID_UNLOAD, state != engine::UNLOADED);
     enable(window, ID_GPU_LIMIT, config::get().device == Device::Auto);
@@ -217,6 +226,11 @@ fn on_command(window: HWND, id: i32, code: u32) {
             let index = unsafe { SendMessageW(control(window, ID_THREADS), CB_GETCURSEL, 0, 0) } as usize;
             choice_changed(window, |c| c.cpu_threads = (index > 0).then_some(index));
         }
+        (ID_SHOW_FRAME | ID_FLASH_FRAME, BN_CLICKED) => {
+            let on = unsafe { SendMessageW(control(window, id), BM_GETCHECK, 0, 0) } == BST_CHECKED as isize;
+            config::update(|c| if id == ID_SHOW_FRAME { c.show_frame = on } else { c.flash_frame = on });
+            crate::update_frame();
+        }
         (ID_DOWNLOAD, BN_CLICKED) => {
             set_text(window, ID_MESSAGE, "");
             if models::PROGRESS.load(Ordering::Relaxed) >= 0 {
@@ -232,11 +246,12 @@ fn on_command(window: HWND, id: i32, code: u32) {
         }
         (ID_DELETE, BN_CLICKED) => {
             let Some(file) = selected_file(window) else { return };
-            let question = wide(&format!("{file} を削除しますか？\nもう一度使うには、ダウンロードし直す必要があります。"));
+            let after = if models::can_download(&file) { "もう一度使うには、ダウンロードし直す必要があります。" } else { "このファイルはごみ箱に入らず、元に戻せません。" };
+            let question = wide(&format!("{file} を削除しますか？\n{after}"));
             let answer = unsafe { MessageBoxW(window, question.as_ptr(), w!("モデルの削除"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) };
             if answer == IDYES {
                 if config::get().model == file {
-                    request_unload();
+                    crate::unload_now();
                     engine::wait_until_stopped(); // Windows cannot delete a file that is in use
                 }
                 if let Err(e) = models::delete(&file) {
@@ -246,7 +261,7 @@ fn on_command(window: HWND, id: i32, code: u32) {
             }
         }
         (ID_LOAD, BN_CLICKED) => request_load(),
-        (ID_UNLOAD, BN_CLICKED) => request_unload(),
+        (ID_UNLOAD, BN_CLICKED) => crate::unload_now(),
         (ID_CLOSE, BN_CLICKED) => unsafe {
             DestroyWindow(window);
         },
@@ -266,6 +281,15 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             WM_TIMER => {
                 refresh(hwnd);
                 0
+            }
+            // The hotkey boxes need the keys in use, but only while this window has the focus.
+            WM_ACTIVATE => {
+                if w & 0xFFFF == WA_INACTIVE as usize || w >> 16 != 0 {
+                    crate::resume_hotkeys();
+                } else {
+                    crate::pause_hotkeys();
+                }
+                DefWindowProcW(hwnd, msg, w, l) // which gives the keyboard focus to the window
             }
             WM_DESTROY => {
                 KillTimer(hwnd, TIMER);
@@ -297,10 +321,10 @@ pub fn register_class() {
 pub fn open() {
     unsafe {
         if !window().is_null() {
+            ShowWindow(window(), SW_RESTORE);
             SetForegroundWindow(window());
             return;
         }
-        crate::pause_hotkeys(); // so that the boxes below can take the keys in use
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let hwnd = CreateWindowExW(
             0,
@@ -319,7 +343,7 @@ pub fn open() {
         WINDOW.set(hwnd);
         let dpi = GetDpiForWindow(hwnd) as i32;
         let s = |v: i32| v * dpi / 96;
-        let mut outer = RECT { left: 0, top: 0, right: s(560), bottom: s(444) };
+        let mut outer = RECT { left: 0, top: 0, right: s(560), bottom: s(500) };
         AdjustWindowRectExForDpi(&mut outer, style, 0, 0, dpi as u32);
         SetWindowPos(hwnd, null_mut(), 0, 0, outer.right - outer.left, outer.bottom - outer.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         FONT.set(CreateFontW(
@@ -385,12 +409,20 @@ pub fn open() {
             SendMessageW(box_, HKM_SETRULES, (HKCOMB_NONE | HKCOMB_S) as usize, (HOTKEYF_CONTROL | HOTKEYF_ALT) as isize);
             write_hotkey(box_, hotkeys[i]);
         }
-        add(hwnd, w!("STATIC"), "", 0, ID_MESSAGE, (20, 360, 520, 24));
-        add(hwnd, w!("STATIC"), "Built with PLaMo", 0, -1, (20, 400, 200, 22));
-        add(hwnd, w!("BUTTON"), "閉じる", button, ID_CLOSE, (440, 394, 100, 32));
+        let check = WS_TABSTOP | BS_AUTOCHECKBOX as u32;
+        add(hwnd, w!("BUTTON"), "翻訳している範囲に緑の枠線を表示する", check, ID_SHOW_FRAME, (20, 354, 520, 24));
+        add(hwnd, w!("BUTTON"), "翻訳が終わったら枠線を一瞬表示する", check, ID_FLASH_FRAME, (20, 382, 520, 24));
+        SendMessageW(control(hwnd, ID_SHOW_FRAME), BM_SETCHECK, config.show_frame as usize, 0);
+        SendMessageW(control(hwnd, ID_FLASH_FRAME), BM_SETCHECK, config.flash_frame as usize, 0);
+        add(hwnd, w!("STATIC"), "", 0, ID_MESSAGE, (20, 416, 520, 24));
+        add(hwnd, w!("STATIC"), "Built with PLaMo", 0, -1, (20, 456, 200, 22));
+        add(hwnd, w!("BUTTON"), "閉じる", button, ID_CLOSE, (440, 450, 100, 32));
 
         fill_models(hwnd);
         refresh(hwnd);
+        if !models::is_present(&config.model) {
+            set_text(hwnd, ID_MESSAGE, "はじめに、翻訳モデルをダウンロードしてください");
+        }
         SetTimer(hwnd, TIMER, TIMER_MS, None);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);

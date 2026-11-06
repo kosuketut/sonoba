@@ -1,18 +1,20 @@
 //! Translation into Japanese with whichever model is selected.
 
 use crate::config;
-use crate::engine::{self, Engine, Options, SLOTS, URL};
+use crate::engine::{self, Engine, Options, SLOTS};
 use crate::models::{self, Format};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const NUM_PREDICT: u32 = 512;
-const TIMEOUT: Duration = Duration::from_secs(60); // covers one long reply
-const LOAD_TIMEOUT: Duration = Duration::from_secs(120); // the larger models take a while
+const NUM_PREDICT: u32 = 1024;
+const MAX_PIECE_CHARS: usize = 1200; // of a paragraph; a reply this long still fits NUM_PREDICT
+const TIMEOUT: Duration = Duration::from_secs(600); // covers one long reply from a large model on a CPU
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+const CANCELLED: &str = "中止しました";
 const CACHE_MAX: usize = 4096;
 const CHUNK_CHARS: usize = 240; // in one request, one paragraph per line
 const CONTEXT_CHARS: usize = 300;
@@ -23,12 +25,13 @@ pub struct Translator {
     cache: Mutex<HashMap<String, String>>,
     engine: Option<Engine>,
     running: Option<(String, Options)>,
+    url: String,
 }
 
 impl Translator {
     pub fn new() -> Self {
         let config = ureq::Agent::config_builder().timeout_global(Some(TIMEOUT)).http_status_as_error(false).build();
-        Self { agent: config.into(), cache: Mutex::new(HashMap::new()), engine: None, running: None }
+        Self { agent: config.into(), cache: Mutex::new(HashMap::new()), engine: None, running: None, url: String::new() }
     }
 
     fn ensure_engine(&mut self) -> Result<(), String> {
@@ -46,24 +49,19 @@ impl Translator {
         if self.running.as_ref().is_some_and(|(file, _)| *file != wanted.0) {
             self.cache.lock().unwrap().clear(); // another model, other translations
         }
-        self.engine = Some(Engine::start(&model, wanted.1)?);
+        let started = Engine::start(&model, wanted.1)?;
+        self.url = started.url.clone();
+        self.engine = Some(started);
         self.running = Some(wanted);
         Ok(())
     }
 
-    /// Starts loading the model, about 3 seconds, without waiting for it: OCR can run meanwhile.
-    pub fn warm_up(&mut self) {
-        if self.ensure_engine().is_ok() {
-            let agent = self.agent.clone();
-            std::thread::spawn(move || {
-                let start = Instant::now();
-                while engine::STATE.load(Ordering::Relaxed) == engine::LOADING && start.elapsed() < LOAD_TIMEOUT {
-                    if is_loaded(&agent) {
-                        engine::STATE.store(engine::READY, Ordering::Relaxed);
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            });
+    /// Loads the model, about 3 seconds, unless `keep_going` turns false first. What goes wrong
+    /// goes to the settings window: nothing else is on show.
+    pub fn warm_up(&mut self, keep_going: &impl Fn() -> bool) {
+        let result = self.ensure_engine().and_then(|_| self.wait_until_loaded(keep_going));
+        if let Some(error) = result.err().filter(|e| e != CANCELLED) {
+            *models::LAST_ERROR.lock().unwrap() = Some(error);
         }
     }
 
@@ -72,14 +70,21 @@ impl Translator {
         self.engine = None;
     }
 
-    fn wait_until_loaded(&mut self) -> Result<(), String> {
-        let start = Instant::now();
-        while !is_loaded(&self.agent) {
+    /// An engine that died while idle is restarted when next needed; until then it is not loaded.
+    pub fn drop_dead_engine(&mut self) {
+        if self.engine.as_mut().is_some_and(|engine| !engine.is_alive()) {
+            self.engine = None;
+        }
+    }
+
+    fn wait_until_loaded(&mut self, keep_going: &impl Fn() -> bool) -> Result<(), String> {
+        while !is_loaded(&self.agent, &self.url) {
             if !self.engine.as_mut().is_some_and(Engine::is_alive) {
-                return Err("翻訳エンジンが止まりました".to_string());
+                self.engine = None;
+                return Err("モデルを読み込めません。GPU メモリの不足か、ファイルの破損が考えられます".to_string());
             }
-            if start.elapsed() > LOAD_TIMEOUT {
-                return Err("翻訳エンジンが応答しません".to_string());
+            if !keep_going() {
+                return Err(CANCELLED.to_string());
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -100,11 +105,11 @@ impl Translator {
         keep_going: &(impl Fn() -> bool + Sync),
         done: &(impl Fn(&str, &str) + Sync),
     ) -> Result<(), String> {
-        if texts.is_empty() {
+        if texts.is_empty() || !keep_going() {
             return Ok(());
         }
         self.ensure_engine()?;
-        self.wait_until_loaded()?;
+        self.wait_until_loaded(keep_going)?;
         let this = &*self;
         let format = models::format_of(self.running.as_ref().map_or("", |(file, _)| file));
         let chunks = chunks(texts);
@@ -149,7 +154,7 @@ impl Translator {
         let body = json!({ "messages": [{ "role": "system", "content": system }, { "role": "user", "content": text }] });
         let mut response = self
             .agent
-            .post(format!("{URL}/apply-template"))
+            .post(format!("{}/apply-template", self.url))
             .header("Content-Type", "application/json")
             .send(body.to_string())
             .map_err(|e| e.to_string())?;
@@ -167,6 +172,9 @@ impl Translator {
         keep_going: &impl Fn() -> bool,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), String> {
+        if !keep_going() {
+            return Err(CANCELLED.to_string());
+        }
         let (prompt, stop) = match format {
             Format::Plamo => (prompt(text, context), json!(["<|plamo:tag|>", "<|plamo:bos|>"])),
             Format::Chat => (self.chat_prompt(text, context)?, json!([])),
@@ -174,16 +182,16 @@ impl Translator {
         let body = json!({ "prompt": prompt, "temperature": 0, "n_predict": NUM_PREDICT, "stop": stop, "stream": true });
         let mut response = self
             .agent
-            .post(format!("{URL}/completion"))
+            .post(format!("{}/completion", self.url))
             .header("Content-Type", "application/json")
             .send(body.to_string())
             .map_err(|e| format!("翻訳エンジンに接続できません: {e}"))?;
         let mut line = String::new();
         for reply in BufReader::new(response.body_mut().as_reader()).lines() {
             if !keep_going() {
-                return Ok(()); // dropping the connection stops the generation
+                return Err(CANCELLED.to_string()); // dropping the connection stops the generation
             }
-            let reply = reply.map_err(|e| e.to_string())?;
+            let reply = reply.map_err(|_| "翻訳エンジンが止まりました".to_string())?;
             if reply.is_empty() {
                 continue;
             }
@@ -221,6 +229,25 @@ fn chunks<'a>(texts: &[&'a str]) -> Vec<Vec<&'a str>> {
     out
 }
 
+/// Cuts a long paragraph at the ends of sentences, so that no reply gets cut off.
+fn pieces(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while rest.len() > MAX_PIECE_CHARS {
+        let mut limit = MAX_PIECE_CHARS;
+        while !rest.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        let window = &rest[..limit];
+        let after_sentence = window.rfind(['.', '!', '?', '。', '！', '？']).map(|i| i + window[i..].chars().next().map_or(1, char::len_utf8));
+        let cut = after_sentence.or_else(|| window.rfind(' ')).filter(|&cut| cut > 0).unwrap_or(limit);
+        out.push(rest[..cut].trim());
+        rest = rest[cut..].trim_start();
+    }
+    out.push(rest.trim_end());
+    out
+}
+
 fn tail(text: &str) -> String {
     let skip = text.chars().count().saturating_sub(CONTEXT_CHARS);
     text.chars().skip(skip).collect()
@@ -251,12 +278,14 @@ fn translate_chunk(chunk: &[&str], ask: &Ask, done: &impl Fn(&str, &str)) -> Res
     }
     for text in again {
         let mut whole = String::new();
-        ask(text, &mut |line| {
-            if !whole.is_empty() && !line.is_empty() {
-                whole.push(' ');
-            }
-            whole.push_str(line);
-        })?;
+        for piece in pieces(text) {
+            ask(piece, &mut |line| {
+                if !whole.is_empty() && !line.is_empty() {
+                    whole.push(' ');
+                }
+                whole.push_str(line);
+            })?;
+        }
         if !whole.is_empty() {
             done(text, &whole);
         }
@@ -264,12 +293,14 @@ fn translate_chunk(chunk: &[&str], ask: &Ask, done: &impl Fn(&str, &str)) -> Res
     Ok(())
 }
 
-fn is_loaded(agent: &ureq::Agent) -> bool {
-    agent.get(format!("{URL}/health")).call().is_ok_and(|response| response.status() == 200)
+fn is_loaded(agent: &ureq::Agent, url: &str) -> bool {
+    let request = agent.get(format!("{url}/health")).config().timeout_global(Some(HEALTH_TIMEOUT)).build();
+    request.call().is_ok_and(|response| response.status() == 200)
 }
 
+/// A lone letter is an icon or a speck the OCR took for one, and nothing worth translating.
 fn needs_model(text: &str) -> bool {
-    text.chars().any(char::is_alphabetic) && !is_japanese(text)
+    text.chars().filter(|c| c.is_alphabetic()).count() >= 2 && !is_japanese(text)
 }
 
 /// Japanese is the target language, so it is left alone. Kana is what tells it from Chinese;
@@ -329,6 +360,32 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_letter_is_left_alone() {
+        let t = Translator::new();
+        assert_eq!(t.known("Q").as_deref(), Some("Q"));
+        assert_eq!(t.known("A 1").as_deref(), Some("A 1"));
+    }
+
+    #[test]
+    fn long_paragraphs_are_cut_after_sentences() {
+        let sentence = "The committee reviewed the proposal and agreed. ";
+        let text = sentence.repeat(60);
+        let parts = pieces(&text);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|p| p.len() <= MAX_PIECE_CHARS && p.ends_with('.')));
+        assert_eq!(parts.join(" ").len(), text.trim_end().len());
+    }
+
+    #[test]
+    fn text_without_sentences_is_still_cut() {
+        let japanese = "あ".repeat(1000);
+        let parts = pieces(&japanese);
+        assert_eq!(parts.concat(), japanese);
+        let words = "word ".repeat(400);
+        assert!(pieces(&words).iter().all(|p| p.len() <= MAX_PIECE_CHARS));
+    }
+
+    #[test]
     fn only_text_with_enough_japanese_counts_as_japanese() {
         assert!(is_japanese("設定を保存しました"));
         assert!(is_japanese("Windows の設定"));
@@ -380,6 +437,22 @@ mod tests {
         let (results, asked) = run(&["Save", "Open"], &[("Save\nOpen", "保存\nOpen"), ("Open", "開く")]);
         assert_eq!(results, pairs(&[("Save", "保存"), ("Open", "開く")]));
         assert_eq!(asked, ["Save\nOpen", "Open"]);
+    }
+
+    #[test]
+    fn a_paragraph_cut_short_is_not_kept() {
+        let text = "One sentence that goes on for a while. ".repeat(50);
+        let asked = RefCell::new(0);
+        let ask = |_: &str, on_line: &mut dyn FnMut(&str)| {
+            *asked.borrow_mut() += 1;
+            if *asked.borrow() > 1 {
+                return Err(CANCELLED.to_string());
+            }
+            on_line("前半");
+            Ok(())
+        };
+        let result = translate_chunk(&[text.as_str()], &ask, &|_, _| panic!("half a translation was kept"));
+        assert_eq!(result.unwrap_err(), CANCELLED);
     }
 
     #[test]

@@ -8,6 +8,10 @@ use std::collections::HashMap;
 pub const KEY_COLOR: u32 = 0x00FF00FF;
 const GLYPH_DISTANCE: i32 = 64; // how far from the background a pixel must be to count as text
 const MARGIN: i32 = 2; // covers the antialiased fringe outside the glyphs
+const GLYPH_STALE_PERCENT: usize = 30; // of the text's edges; compression noise moves a few
+pub const WOBBLE_PERCENT: usize = 2; // edges that change without the text changing, around a thin outline
+const EDGE_COLUMNS: usize = 2;
+const EDGE_PX: usize = 2; // a text edge rises within this many pixels, most of a video's do not
 const SAME_BG: i32 = 30;
 const SAME_FG: i32 = 80; // thin text rarely reaches its true colour, so allow for that
 const BOLD_STEM: usize = 8; // a stem wider than 1/8 of the line height, less one antialiased pixel
@@ -51,6 +55,7 @@ pub struct Patch {
     pub fg: u32,
     pub bold: bool,
     pub text: String,
+    pub source: String, // what OCR read
     pub px: i32,     // font size, set when laid out on the UI thread
     pub text_h: i32, // measured height, ditto
 }
@@ -91,12 +96,21 @@ pub fn glyphs(bgra: &[u8], width: usize, height: usize, (x, y, w, h): (i32, i32,
         }
     }
     let [n, b, g, r] = *bins.values().max_by_key(|bin| bin[0])?;
-    let bg = [(b / n) as i32, (g / n) as i32, (r / n) as i32];
+    let mut bg = [(b / n) as i32, (g / n) as i32, (r / n) as i32];
+    // A picture has no common colour, so the letters of a thick subtitle can come first. The
+    // box reaches past the text, so its two ends are the background then.
+    let picture = n * 2 < (middle.len() * (x1 - x0)) as u64;
+    if picture {
+        let ends: Vec<usize> = (x0..x1).take(EDGE_COLUMNS).chain((x0..x1).rev().take(EDGE_COLUMNS)).collect();
+        let around: Vec<[i32; 3]> = middle.clone().flat_map(|row| ends.iter().map(move |&col| (col, row))).map(|(col, row)| pixel(bgra, width, col, row)).collect();
+        bg = [0, 1, 2].map(|c| around.iter().map(|p| p[c]).sum::<i32>() / around.len().max(1) as i32);
+    }
     let is_ink = |col: usize, row: usize| distance(pixel(bgra, width, col, row), bg) > GLYPH_DISTANCE;
 
     // The box is much taller than any letter, so a column of ink in most rows is a rule.
     let rows = y1 - y0;
-    let mut cols: Vec<usize> = (x0..x1).filter(|&col| (y0..y1).filter(|&row| is_ink(col, row)).count() * 10 < rows * 7).collect();
+    let is_rule = |col: usize| !picture && (y0..y1).filter(|&row| is_ink(col, row)).count() * 10 >= rows * 7;
+    let mut cols: Vec<usize> = (x0..x1).filter(|&col| !is_rule(col)).collect();
 
     let band = |cols: &[usize]| {
         let (mut found, mut best, mut run_top, mut blank) = (None, i32::MIN, None, 0);
@@ -166,6 +180,10 @@ pub fn glyphs(bgra: &[u8], width: usize, height: usize, (x, y, w, h): (i32, i32,
         }
     }
 
+    if top >= bottom {
+        return None; // the seam search can leave nothing between two seams
+    }
+
     let (mut left, mut right) = (x1, x0);
     let (mut fg, mut farthest) = (bg, 0);
     let mut runs = [0u32; 32];
@@ -185,6 +203,9 @@ pub fn glyphs(bgra: &[u8], width: usize, height: usize, (x, y, w, h): (i32, i32,
                 (fg, farthest) = (p, far);
             }
         }
+    }
+    if right < left {
+        return None;
     }
     let half = runs.iter().sum::<u32>() / 2;
     let mut seen = 0;
@@ -208,7 +229,47 @@ impl Patch {
         let free = ((g.x + g.w) as usize..width).find(|&col| !empty(col)).unwrap_or(width) as i32;
         let max_w = if block.lines == 1 { (free - MARGIN - x).max(w) } else { w };
         let (bg, fg) = (colorref(g.bg), colorref(g.fg));
-        Self { x, y, w, max_w, h, em: block.em, bg, fg, bold: g.bold(), text, px: 0, text_h: 0 }
+        Self { x, y, w, max_w, h, em: block.em, bg, fg, bold: g.bold(), text, source: block.text.clone(), px: 0, text_h: 0 }
+    }
+
+    /// How much of the original text has gone, in percent. Only its sharpest edges count: a video
+    /// playing behind a subtitle can change every other pixel, even the subtitle's outline.
+    pub fn changed_percent(&self, frame: &[u8], basis: &[u8], width: usize) -> usize {
+        let height = frame.len() / 4 / width;
+        let rows = self.y.max(0) as usize..((self.y + self.h).max(0) as usize).min(height);
+        let columns = self.x.max(0) as usize..((self.x + self.w).max(0) as usize).min(width.saturating_sub(EDGE_PX));
+        let edge = |image: &[u8], x: usize, y: usize| {
+            let (a, b) = (pixel(image, width, x, y), pixel(image, width, x + EDGE_PX, y));
+            [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+        };
+        let dot = |a: [i32; 3], b: [i32; 3]| (0..3).map(|c| a[c] * b[c]).sum::<i32>();
+        let mut sharpest = 0;
+        for y in rows.clone() {
+            for x in columns.clone() {
+                let was = edge(basis, x, y);
+                sharpest = sharpest.max(dot(was, was));
+            }
+        }
+        let (mut edges, mut gone) = (0, 0);
+        for y in rows {
+            for x in columns.clone() {
+                let was = edge(basis, x, y);
+                if dot(was, was) * 4 > sharpest {
+                    edges += 1;
+                    gone += (dot(edge(frame, x, y), was) * 4 < dot(was, was)) as usize;
+                }
+            }
+        }
+        gone * 100 / edges.max(1)
+    }
+
+    pub fn overlaps(&self, other: &Patch) -> bool {
+        self.x < other.x + other.w && other.x < self.x + self.w && self.y < other.y + other.h && other.y < self.y + self.h
+    }
+
+    /// True once the original text is no longer there.
+    pub fn is_stale(&self, frame: &[u8], basis: &[u8], width: usize) -> bool {
+        self.changed_percent(frame, basis, width) > GLYPH_STALE_PERCENT
     }
 
     /// A message in the region's top left corner, sized to its text.
@@ -224,6 +285,7 @@ impl Patch {
             fg: STATUS_FG,
             bold: false,
             text: text.to_string(),
+            source: String::new(),
             px: 0,
             text_h: 0,
         }
@@ -402,6 +464,87 @@ mod tests {
         assert!(page.same_style(&at([1, 0, 0], [220, 230, 236])));
         assert!(!page.same_style(&at([35, 31, 27], [236, 236, 236])));
         assert!(!page.same_style(&at([0, 0, 0], [90, 170, 240])));
+    }
+
+    fn on_white(img: &[u8], width: usize, height: usize) -> Patch {
+        let g = glyphs(img, width, height, (0, 0, width as i32, height as i32), None).unwrap();
+        Patch::new(img, width, height, &Block { glyphs: g, lines: 1, em: 12, text: "x".into() }, "訳".into())
+    }
+
+    #[test]
+    fn a_moving_background_does_not_make_text_stale() {
+        let mut basis = canvas(100, 40, WHITE);
+        paint(&mut basis, 100, (10, 14, 90, 26), BLACK, 3);
+        let patch = on_white(&basis, 100, 40);
+        let mut video = canvas(100, 40, [90, 140, 30]);
+        paint(&mut video, 100, (10, 14, 90, 26), BLACK, 3);
+        assert!(!patch.is_stale(&video, &basis, 100));
+    }
+
+    #[test]
+    fn a_video_behind_an_outlined_subtitle_changes_nothing() {
+        let subtitle = |back: [u8; 3]| {
+            let mut img = canvas(100, 40, back);
+            paint(&mut img, 100, (9, 13, 91, 27), BLACK, 1);
+            paint(&mut img, 100, (10, 14, 90, 26), WHITE, 4);
+            img
+        };
+        let basis = subtitle([60, 70, 80]);
+        let patch = on_white(&basis, 100, 40);
+        for back in [[20, 30, 40], [150, 130, 100], [230, 230, 230]] {
+            assert!(patch.changed_percent(&subtitle(back), &basis, 100) <= WOBBLE_PERCENT);
+        }
+    }
+
+    #[test]
+    fn a_thick_subtitle_over_a_picture_is_covered_from_top_to_bottom() {
+        let (w, h) = (300, 60);
+        let mut img = canvas(w, h, WHITE);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (40 + x / 4 + y) as u8;
+                img[(y * w + x) * 4..][..3].copy_from_slice(&[v, v + 10, v + 20]);
+            }
+        }
+        for left in (20..270).step_by(16) {
+            paint(&mut img, w, (left, 12, left + 12, 48), BLACK, 1);
+            paint(&mut img, w, (left + 2, 14, left + 10, 46), WHITE, 1);
+        }
+        let g = glyphs(&img, w, h, (0, 0, w as i32, h as i32), None).unwrap();
+        assert!(g.y <= 12 && g.y + g.h >= 48, "{} {}", g.y, g.h);
+        assert!(g.bg.iter().sum::<i32>() < 3 * 170 && g.fg == [255, 255, 255], "{:?} {:?}", g.bg, g.fg);
+    }
+
+    #[test]
+    fn one_letter_changing_is_not_wobble() {
+        let mut basis = canvas(100, 40, WHITE);
+        paint(&mut basis, 100, (10, 14, 90, 26), BLACK, 3);
+        let patch = on_white(&basis, 100, 40);
+        let mut next = basis.clone();
+        paint(&mut next, 100, (70, 14, 78, 26), WHITE, 1);
+        let changed = patch.changed_percent(&next, &basis, 100);
+        assert!(changed > WOBBLE_PERCENT && !patch.is_stale(&next, &basis, 100), "{changed}");
+    }
+
+    #[test]
+    fn other_text_in_the_same_place_is_stale() {
+        let mut basis = canvas(100, 40, WHITE);
+        paint(&mut basis, 100, (10, 14, 90, 26), BLACK, 3);
+        let patch = on_white(&basis, 100, 40);
+        let mut other = canvas(100, 40, WHITE);
+        paint(&mut other, 100, (11, 14, 90, 26), BLACK, 3);
+        assert!(patch.is_stale(&other, &basis, 100));
+    }
+
+    #[test]
+    fn seams_that_leave_nothing_are_no_line() {
+        let mut img = canvas(100, 30, WHITE);
+        paint(&mut img, 100, (10, 0, 90, 12), BLACK, 3);
+        paint(&mut img, 100, (40, 12, 41, 16), BLACK, 1); // thin rows right at the middle
+        paint(&mut img, 100, (10, 16, 90, 30), BLACK, 3);
+        if let Some(g) = glyphs(&img, 100, 30, (0, 0, 100, 30), Some("word")) {
+            assert!(g.h > 0 && g.w > 0);
+        }
     }
 
     #[test]

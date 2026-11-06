@@ -21,6 +21,8 @@ pub struct Config {
     pub device: Device,
     pub cpu_threads: Option<usize>, // None: every performance core
     pub gpu_limit_mib: Option<u64>, // None: whatever fits
+    pub show_frame: bool, // a thin frame around the region while a job runs
+    pub flash_frame: bool, // the frame for a moment whenever a translation finishes
     pub hotkeys: [Hotkey; 3], // one shot, live, clear
 }
 
@@ -32,6 +34,8 @@ impl Default for Config {
             device: Device::Auto,
             cpu_threads: None,
             gpu_limit_mib: None,
+            show_frame: false,
+            flash_frame: false,
             hotkeys: [ctrl_alt('T'), ctrl_alt('R'), ctrl_alt('X')],
         }
     }
@@ -52,6 +56,8 @@ impl Config {
         };
         config.cpu_threads = saved["cpu_threads"].as_u64().map(|n| (n as usize).max(1));
         config.gpu_limit_mib = saved["gpu_limit_mib"].as_u64();
+        config.show_frame = saved["show_frame"].as_bool().unwrap_or(false);
+        config.flash_frame = saved["flash_frame"].as_bool().unwrap_or(false);
         for (slot, name) in config.hotkeys.iter_mut().zip(["once", "live", "clear"]) {
             if let (Some(mods), Some(key)) = (saved[name]["mods"].as_u64(), saved[name]["key"].as_u64()) {
                 *slot = Hotkey { mods: mods as u32, key: key as u32 };
@@ -72,6 +78,8 @@ impl Config {
             "device": device,
             "cpu_threads": self.cpu_threads,
             "gpu_limit_mib": self.gpu_limit_mib,
+            "show_frame": self.show_frame,
+            "flash_frame": self.flash_frame,
             "once": hotkey(&self.hotkeys[0]),
             "live": hotkey(&self.hotkeys[1]),
             "clear": hotkey(&self.hotkeys[2]),
@@ -120,6 +128,8 @@ mod tests {
         config.device = Device::Cpu;
         config.cpu_threads = Some(3);
         config.gpu_limit_mib = Some(1536);
+        config.show_frame = true;
+        config.flash_frame = true;
         config.hotkeys[1] = Hotkey { mods: 6, key: 0x70 };
         assert_eq!(Config::parse(&config.to_json()), config);
     }

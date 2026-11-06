@@ -130,7 +130,7 @@ impl Ocr {
         let margin = (ink.h / 2) as usize;
         let top = ((ink.y + PAD as i32) as usize).saturating_sub(margin).max(y);
         let bottom = ((ink.y + ink.h + PAD as i32) as usize + margin).min(y + bh);
-        let text = self.recognize(img, (x, top, bw, bottom - top))?;
+        let text = self.recognize(img, (x, top, bw, bottom.saturating_sub(top)))?;
         let first_word = text.split(' ').next().unwrap_or("");
         Ok(patch::glyphs(bgra, w, h, in_frame, Some(first_word))
             .filter(|_| !text.is_empty())
@@ -163,6 +163,9 @@ impl Ocr {
 
     fn recognize(&self, img: &Rgbf, rect: (usize, usize, usize, usize)) -> Result<String, String> {
         let (_, _, bw, bh) = rect;
+        if bw == 0 || bh == 0 {
+            return Ok(String::new());
+        }
         let width = (bw * REC_HEIGHT).div_ceil(bh).clamp(1, REC_MAX_WIDTH);
         let stride = width.max(REC_MIN_WIDTH);
         let input = NdTensor::from_data([1, 3, REC_HEIGHT, stride], img.sample_chw(rect, width, REC_HEIGHT, stride));
@@ -315,7 +318,9 @@ pub fn paragraphs(lines: &[Line]) -> Vec<Block> {
 /// Code stays as it is: the model would otherwise paraphrase it. Prose rarely spends one
 /// character in twelve on these.
 pub fn looks_like_code(text: &str) -> bool {
-    text.matches(['=', '(', ')', '{', '}', '[', ']', ';', '_', '<', '>']).count() * 12 >= text.chars().count()
+    let symbols = text.matches(['=', '(', ')', '{', '}', '[', ']', ';', '_', '<', '>']).count();
+    let prose_brackets = text.matches(" (").count() * 2; // "Save (Ctrl+S)": code has them right after a name
+    symbols.saturating_sub(prose_brackets) * 12 >= text.chars().count()
 }
 
 /// True when `b` carries on the paragraph that `a` ended, wrapped by the layout.
@@ -410,6 +415,8 @@ mod tests {
     fn code_is_told_from_prose() {
         assert!(looks_like_code("while not done: action = llm(context) result = run_tool(action) context += result"));
         assert!(looks_like_code("result = run_tool(action)"));
+        assert!(!looks_like_code("Settings (Beta)"));
+        assert!(!looks_like_code("Save (Ctrl+S)"));
         assert!(!looks_like_code("Tool calling lets a model request a function in a predictable shape (mostly)."));
         assert!(!looks_like_code("error: cannot borrow `x` as mutable because it is also borrowed as immutable"));
     }
@@ -477,6 +484,38 @@ mod tests {
                 ("Press any key to continue", false),
             ]
         );
+    }
+
+    /// Video frames are noisy, and once brought the seam search down to a line of no height.
+    #[test]
+    fn noisy_frames_never_panic() {
+        let ocr = Ocr::new(4).unwrap();
+        let (clean, w, h) = png_bgra("testdata/paragraphs.png");
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..24 {
+            let mut noisy = clean.clone();
+            for _ in 0..round * 400 {
+                let (x, y) = ((next() % w as u64) as usize, (next() % h as u64) as usize);
+                let (dw, dh) = ((next() % 40 + 1) as usize, (next() % 6 + 1) as usize);
+                let shade = (next() % 256) as u8;
+                for row in y..(y + dh).min(h) {
+                    for col in x..(x + dw).min(w) {
+                        noisy[(row * w + col) * 4..][..3].fill(shade);
+                    }
+                }
+            }
+            let lines = ocr.read(&noisy, w, h).unwrap();
+            for block in paragraphs(&lines) {
+                let patch = patch::Patch::new(&noisy, w, h, &block, "訳".into());
+                assert!(patch.w > 0 && patch.h > 0);
+            }
+        }
     }
 
     /// The same renders RapidOCR read without a single mistake.
