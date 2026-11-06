@@ -1,6 +1,7 @@
 //! PP-OCRv6 small: DB text detection, then CTC recognition, both on the CPU.
 //! The values below match RapidOCR's PP-OCRv6 config so results stay comparable.
 
+use crate::patch;
 use rten::Model;
 use rten_tensor::NdTensor;
 
@@ -27,6 +28,7 @@ pub struct Line {
     pub w: i32,
     pub h: i32,
     pub text: String,
+    pub style: ([i32; 3], [i32; 3]),
 }
 
 /// A BGR image with values already in the -1..1 range the models expect.
@@ -107,8 +109,9 @@ impl Ocr {
         for (x, y, bw, bh) in self.detect(&img)? {
             let text = self.recognize(&img, (x, y, bw, bh))?;
             if !text.is_empty() {
-                let (lx, ly) = (x as i32 - PAD as i32, y as i32 - PAD as i32);
-                lines.push(Line { x: lx, y: ly, w: bw as i32, h: bh as i32, text });
+                let (lx, ly, lw, lh) = (x as i32 - PAD as i32, y as i32 - PAD as i32, bw as i32, bh as i32);
+                let style = patch::palette(bgra, w, h, lx, ly, lw, lh);
+                lines.push(Line { x: lx, y: ly, w: lw, h: lh, text, style });
             }
         }
         reading_order(&mut lines);
@@ -231,41 +234,56 @@ fn same_row(a: &Line, b: &Line) -> bool {
     overlap * 2 > a.h.min(b.h)
 }
 
+/// One paragraph and the rectangle it occupies in the image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Block {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub lines: i32,
+    pub text: String,
+}
+
 /// Joins wrapped lines so each paragraph reaches the translator as a whole sentence.
-pub fn paragraphs(lines: &[Line]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+pub fn paragraphs(lines: &[Line]) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
     let mut prev: Option<&Line> = None;
-    let mut right = 0;
     for line in lines {
-        match prev.filter(|a| continues(a, line, right)) {
-            Some(_) => {
-                let last = out.last_mut().unwrap();
-                let hyphen = last.ends_with('-') && line.text.starts_with(|c: char| c.is_lowercase());
+        match out.last_mut().filter(|b| prev.is_some_and(|a| continues(a, line, b.x + b.w))) {
+            Some(block) => {
+                let hyphen = block.text.ends_with('-') && line.text.starts_with(|c: char| c.is_lowercase());
                 if hyphen {
-                    last.pop();
+                    block.text.pop();
                 } else {
-                    last.push(' ');
+                    block.text.push(' ');
                 }
-                last.push_str(&line.text);
-                right = right.max(line.x + line.w);
+                block.text.push_str(&line.text);
+                let (right, bottom) = ((block.x + block.w).max(line.x + line.w), (block.y + block.h).max(line.y + line.h));
+                (block.x, block.y) = (block.x.min(line.x), block.y.min(line.y));
+                (block.w, block.h) = (right - block.x, bottom - block.y);
+                block.lines += 1;
             }
-            None => {
-                out.push(line.text.clone());
-                right = line.x + line.w;
-            }
+            None => out.push(Block { x: line.x, y: line.y, w: line.w, h: line.h, lines: 1, text: line.text.clone() }),
         }
         prev = Some(line);
     }
     out
 }
 
+/// Code stays as it is: the model would otherwise paraphrase it. Prose rarely spends one
+/// character in twelve on these.
+pub fn looks_like_code(text: &str) -> bool {
+    text.matches(['=', '(', ')', '{', '}', '[', ']', ';', '_', '<', '>']).count() * 12 >= text.chars().count()
+}
+
 /// True when `b` carries on the paragraph that `a` ended, wrapped by the layout.
 fn continues(a: &Line, b: &Line, para_right: i32) -> bool {
     let h = a.h.max(b.h);
     let gap = b.y - (a.y + a.h);
-    let similar_height = (a.h - b.h).abs() * 3 <= h;
+    let similar_height = (a.h - b.h).abs() * 4 <= h;
     let same_column = (a.x + a.w).min(b.x + b.w) > a.x.max(b.x);
-    if same_row(a, b) || gap * 2 > h || !similar_height || !same_column {
+    if same_row(a, b) || gap * 5 > h * 2 || !similar_height || !same_column || !patch::same_style(&a.style, &b.style) {
         return false;
     }
     if b.text.starts_with(|c: char| c.is_lowercase()) {
@@ -285,13 +303,16 @@ mod tests {
     use super::*;
 
     fn l(x: i32, y: i32, w: i32, text: &str) -> Line {
-        Line { x, y, w, h: 20, text: text.into() }
+        Line { x, y, w, h: 20, text: text.into(), style: ([0; 3], [0; 3]) }
     }
 
     #[test]
     fn wrapped_lines_join_and_labels_stay_apart() {
         let wrapped = [l(0, 0, 500, "The quick update changes how"), l(0, 24, 300, "tasks are scheduled.")];
-        assert_eq!(paragraphs(&wrapped), ["The quick update changes how tasks are scheduled."]);
+        let joined = paragraphs(&wrapped);
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].text, "The quick update changes how tasks are scheduled.");
+        assert_eq!((joined[0].x, joined[0].y, joined[0].w, joined[0].h, joined[0].lines), (0, 0, 500, 44, 2));
 
         let menu = [l(0, 0, 60, "Sign in"), l(0, 24, 80, "Settings"), l(0, 48, 300, "About this application")];
         assert_eq!(paragraphs(&menu).len(), 3);
@@ -300,18 +321,31 @@ mod tests {
         assert_eq!(paragraphs(&far).len(), 2);
 
         // Detector boxes are 30px tall here, so one blank line leaves a gap of only 20.
-        let tall = |y, w, text: &str| Line { x: 0, y, w, h: 30, text: text.into() };
+        let tall = |y, w, text: &str| Line { x: 0, y, w, h: 30, text: text.into(), style: ([0; 3], [0; 3]) };
         let blank_line = [tall(123, 980, "before saving, otherwise the file may be incomplete."), tall(173, 975, "Press any key")];
         assert_eq!(paragraphs(&blank_line).len(), 2);
 
         let columns = [l(0, 0, 100, "Name"), l(400, 0, 100, "Value")];
         assert_eq!(paragraphs(&columns).len(), 2);
+
+        // A lowercase start is no reason to join text onto a differently coloured panel.
+        let mut code = l(0, 24, 300, "python");
+        code.style = ([35, 31, 27], [180, 180, 180]);
+        assert_eq!(paragraphs(&[l(0, 0, 500, "pay more for the output."), code]).len(), 2);
+    }
+
+    #[test]
+    fn code_is_told_from_prose() {
+        assert!(looks_like_code("while not done: action = llm(context) result = run_tool(action) context += result"));
+        assert!(looks_like_code("result = run_tool(action)"));
+        assert!(!looks_like_code("Tool calling lets a model request a function in a predictable shape (mostly)."));
+        assert!(!looks_like_code("error: cannot borrow `x` as mutable because it is also borrowed as immutable"));
     }
 
     #[test]
     fn hyphenated_wrap_rejoins_the_word() {
         let lines = [l(0, 0, 500, "this is an inter-"), l(0, 24, 300, "national update")];
-        assert_eq!(paragraphs(&lines), ["this is an international update"]);
+        assert_eq!(paragraphs(&lines)[0].text, "this is an international update");
     }
 
     #[test]
@@ -363,7 +397,29 @@ mod tests {
         let lines = ocr.read(&bgra, w, h).unwrap();
         let got = paragraphs(&lines);
         assert_eq!(got.len(), 4, "{got:#?}");
-        assert_eq!(got[3], "Press any key to continue");
+        assert_eq!(got[3].text, "Press any key to continue");
+    }
+
+    #[test]
+    fn bold_is_recognised_at_heading_and_body_sizes() {
+        let ocr = Ocr::new().unwrap();
+        let (bgra, w, h) = png_bgra("testdata/weights.png");
+        let raw = ocr.read(&bgra, w, h).unwrap();
+        let blocks = paragraphs(&raw);
+        let got: Vec<_> = blocks
+            .iter()
+            .map(|b| (b.text.as_str(), patch::Patch::new(&bgra, w, h, b, b.text.clone()).unwrap().bold))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("First the problem Jev is solving", true),
+                ("First the problem Jev is solving", false),
+                ("Tool calling lets a model request a function", true),
+                ("Tool calling lets a model request a function", false),
+                ("Press any key to continue", false),
+            ]
+        );
     }
 
     /// The same renders RapidOCR read without a single mistake.
@@ -378,7 +434,7 @@ mod tests {
             let start = std::time::Instant::now();
             let lines = ocr.read(&bgra, w, h).unwrap();
             let elapsed = start.elapsed();
-            let got = paragraphs(&lines).join(" / ");
+            let got = paragraphs(&lines).iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" / ");
             println!("{name}: {elapsed:?} {got}");
             assert_eq!(got, WANT, "{name}");
         }

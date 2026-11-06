@@ -1,13 +1,17 @@
 //! Screen OCR and English to Japanese translation, driven by global hotkeys.
 //!
-//! No window here ever takes the keyboard focus: the selection layer and the panel are
+//! No window here ever takes the keyboard focus: the selection layer and the overlay are
 //! WS_EX_NOACTIVATE and Esc is a hotkey, so the active window stays active throughout.
+//! The overlay also lets the mouse through, and capture skips it, so OCR keeps seeing the
+//! original text underneath the translation.
 #![windows_subsystem = "windows"]
 
 mod capture;
 mod ocr;
+mod patch;
 mod translate;
 
+use patch::{KEY_COLOR, Patch};
 use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,25 +30,20 @@ const POLL: Duration = Duration::from_millis(150);
 const PARTIAL_AFTER: Duration = Duration::from_millis(300); // show finished paragraphs of long pages
 const OCR_IDLE: Duration = Duration::from_secs(60); // free the OCR models this long after the last job
 const MIN_SELECTION: i32 = 8;
-const PANEL_MIN_WIDTH: i32 = 420;
-const FONT_PX: i32 = 20;
-const PAD_PX: i32 = 12;
+const MIN_TEXT_PX: i32 = 11; // below this Japanese stops being legible; the patch grows instead
+const STATUS_PX: i32 = 16;
 
 const HK_ONCE: i32 = 1;
 const HK_LIVE: i32 = 2;
 const HK_STOP: i32 = 3;
 const HK_ESC: i32 = 4;
-const WM_TEXT: u32 = WM_APP + 1;
+const WM_PATCHES: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const MENU_EXIT: usize = 1;
 
-const KEY_COLOR: u32 = 0x00FF00FF; // shows through the dim layer: the selected rectangle
 const DIM_ALPHA: u8 = 110;
-const PANEL_ALPHA: u8 = 238;
-const PANEL_BG: u32 = 0x00201C1C;
-const PANEL_FG: u32 = 0x00F5F5F5;
 
-const NOT_FOUND: &str = "文字が見つかりません";
+const NOT_FOUND: &str = "翻訳する文字が見つかりません";
 const WORKING: &str = "翻訳中…";
 
 #[derive(Clone, Copy)]
@@ -77,7 +76,7 @@ fn is_current(id: u64) -> bool {
 
 // --- Worker: capture, OCR, translate. One thread, so it can never fall behind the screen.
 
-fn worker(panel: usize) {
+fn worker(overlay: usize) {
     let mut models: Option<ocr::Ocr> = None;
     let mut translator = translate::Translator::new();
     loop {
@@ -91,17 +90,17 @@ fn worker(panel: usize) {
         }
         let current = job.unwrap();
         drop(job);
-        run(current, &mut models, &mut translator, panel);
+        run(current, &mut models, &mut translator, overlay);
     }
 }
 
-fn run(job: Job, models: &mut Option<ocr::Ocr>, translator: &mut translate::Translator, panel: usize) {
-    let post = |text: String| unsafe {
-        PostMessageW(panel as HWND, WM_TEXT, job.id as usize, Box::into_raw(Box::new(text)) as isize);
+fn run(job: Job, models: &mut Option<ocr::Ocr>, translator: &mut translate::Translator, overlay: usize) {
+    let post = |patches: Vec<Patch>| unsafe {
+        PostMessageW(overlay as HWND, WM_PATCHES, job.id as usize, Box::into_raw(Box::new(patches)) as isize);
     };
     let Region { x, y, w, h } = job.region;
     let Some(grabber) = capture::Grabber::new(w, h) else {
-        post("画面を取得できません".to_string());
+        post(vec![Patch::status("画面を取得できません", w)]);
         return set_job(None);
     };
     let mut last: Vec<u8> = Vec::new();
@@ -112,10 +111,10 @@ fn run(job: Job, models: &mut Option<ocr::Ocr>, translator: &mut translate::Tran
             last.clear();
             last.extend_from_slice(frame);
             let result = translate_frame(frame, job, models, translator, &post);
-            let text = result.unwrap_or_else(|e| format!("エラー: {e}"));
-            if is_current(job.id) && shown.as_ref() != Some(&text) {
-                post(text.clone());
-                shown = Some(text);
+            let patches = result.unwrap_or_else(|e| vec![Patch::status(&format!("エラー: {e}"), w)]);
+            if is_current(job.id) && shown.as_ref() != Some(&patches) {
+                post(patches.clone());
+                shown = Some(patches);
             }
         }
         if !job.live {
@@ -134,36 +133,44 @@ fn translate_frame(
     job: Job,
     models: &mut Option<ocr::Ocr>,
     translator: &mut translate::Translator,
-    post: &impl Fn(String),
-) -> Result<String, String> {
+    post: &impl Fn(Vec<Patch>),
+) -> Result<Vec<Patch>, String> {
     if models.is_none() {
         *models = Some(ocr::Ocr::new()?);
     }
-    let Region { w, h, .. } = job.region;
-    let lines = models.as_ref().unwrap().read(frame, w as usize, h as usize)?;
-    let paragraphs = ocr::paragraphs(&lines);
-    if paragraphs.is_empty() {
-        return Ok(if job.live { String::new() } else { NOT_FOUND.to_string() });
-    }
-    let (mut out, mut last_post) = (Vec::new(), Instant::now());
-    for paragraph in &paragraphs {
-        out.push(translator.translate(paragraph)?);
+    let (w, h) = (job.region.w as usize, job.region.h as usize);
+    let lines = models.as_ref().unwrap().read(frame, w, h)?;
+    let blocks = ocr::paragraphs(&lines);
+    let (mut out, mut history, mut last_post) = (Vec::new(), Vec::new(), Instant::now());
+    for (i, block) in blocks.iter().enumerate() {
+        if ocr::looks_like_code(&block.text) {
+            continue;
+        }
+        let text = translator.translate(&block.text, &history[history.len().saturating_sub(translate::HISTORY)..])?;
         if !is_current(job.id) {
             break;
         }
-        if last_post.elapsed() > PARTIAL_AFTER && out.len() < paragraphs.len() {
-            post(out.join("\n"));
+        // Numbers, code and the like come back unchanged: leave the original on show.
+        if text.to_lowercase() != block.text.to_lowercase() {
+            history.push((block.text.clone(), text.clone()));
+            out.extend(Patch::new(frame, w, h, block, text));
+        }
+        if last_post.elapsed() > PARTIAL_AFTER && i + 1 < blocks.len() {
+            post(out.clone());
             last_post = Instant::now();
         }
     }
-    Ok(out.join("\n"))
+    if out.is_empty() && !job.live {
+        out.push(Patch::status(NOT_FOUND, job.region.w));
+    }
+    Ok(out)
 }
 
 // --- UI thread state. Cells only: window procedures re-enter while Win32 calls run.
 
 struct Ui {
     main: Cell<HWND>,
-    panel: Cell<HWND>,
+    overlay: Cell<HWND>,
     select: Cell<HWND>,
     live_next: Cell<bool>, // the selection in progress starts a live job
     drag_from: Cell<Option<(i32, i32)>>,
@@ -171,14 +178,13 @@ struct Ui {
     region: Cell<Region>,
     job_id: Cell<u64>, // results from older jobs are dropped
     live: Cell<bool>,
-    placed: Cell<bool>, // panel position chosen for this job; keep it so dragging sticks
-    text: RefCell<Vec<u16>>,
+    patches: RefCell<Vec<Patch>>,
 }
 
 thread_local! {
     static UI: Ui = Ui {
         main: Cell::new(null_mut()),
-        panel: Cell::new(null_mut()),
+        overlay: Cell::new(null_mut()),
         select: Cell::new(null_mut()),
         live_next: Cell::new(false),
         drag_from: Cell::new(None),
@@ -186,8 +192,7 @@ thread_local! {
         region: Cell::new(Region { x: 0, y: 0, w: 0, h: 0 }),
         job_id: Cell::new(0),
         live: Cell::new(false),
-        placed: Cell::new(false),
-        text: RefCell::new(Vec::new()),
+        patches: RefCell::new(Vec::new()),
     };
 }
 
@@ -204,7 +209,7 @@ fn stop() {
     UI.with(|ui| {
         ui.live.set(false);
         ui.job_id.set(0);
-        unsafe { ShowWindow(ui.panel.get(), SW_HIDE) };
+        unsafe { ShowWindow(ui.overlay.get(), SW_HIDE) };
     });
 }
 
@@ -278,8 +283,7 @@ unsafe fn finish_select(hwnd: HWND) {
         ui.region.set(region);
         ui.job_id.set(id);
         ui.live.set(live);
-        ui.placed.set(false);
-        show_text(WORKING);
+        show_patches(vec![Patch::status(WORKING, region.w)]);
         set_job(Some(Job { region, live, id }));
     });
 }
@@ -336,18 +340,16 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     }
 }
 
-// --- Result panel
+// --- Overlay: everything is the see-through key colour except the patches
 
-unsafe fn panel_font(hwnd: HWND) -> (HFONT, i32) {
+unsafe fn text_font(px: i32, bold: bool) -> HFONT {
     unsafe {
-        let dpi = GetDpiForWindow(hwnd) as i32;
-        let px = FONT_PX * dpi / 96;
-        let font = CreateFontW(
+        CreateFontW(
             -px,
             0,
             0,
             0,
-            FW_NORMAL as i32,
+            if bold { FW_BOLD } else { FW_NORMAL } as i32,
             0,
             0,
             0,
@@ -357,109 +359,129 @@ unsafe fn panel_font(hwnd: HWND) -> (HFONT, i32) {
             CLEARTYPE_QUALITY as u32,
             DEFAULT_PITCH as u32,
             w!("Yu Gothic UI"),
-        );
-        (font, PAD_PX * dpi / 96)
+        )
     }
 }
 
-/// Stores `text` and sizes the panel to it. Empty text hides the panel.
-fn show_text(text: &str) {
+const TEXT_FLAGS: DRAW_TEXT_FORMAT = DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL;
+
+/// Picks the largest font that keeps the text inside the patch, starting from the height of
+/// the original lines, and grows the patch only when even MIN_TEXT_PX does not fit.
+unsafe fn fit(hdc: HDC, patch: &mut Patch, status_px: i32) {
+    let text = wide(&patch.text);
+    let measure = |px: i32, width: i32| unsafe {
+        let font = text_font(px, patch.bold);
+        let old = SelectObject(hdc, font);
+        let mut rect = RECT { left: 0, top: 0, right: width, bottom: 0 };
+        DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut rect, TEXT_FLAGS | DT_CALCRECT);
+        SelectObject(hdc, old);
+        DeleteObject(font);
+        rect
+    };
+    let status = patch.h == 0;
+    let mut px = if status { status_px } else { (patch.h / patch.lines).max(MIN_TEXT_PX) };
+    let (size, width) = loop {
+        let room = patch.h + px / 3; // the last line's leading is empty, so it may stick out
+        let normal = measure(px, patch.w);
+        if normal.bottom <= room {
+            break (normal, patch.w);
+        }
+        let spread = measure(px, patch.max_w);
+        if spread.bottom <= room {
+            break (spread, patch.w.max(spread.right + 1));
+        }
+        if status || px <= MIN_TEXT_PX {
+            patch.h = normal.bottom;
+            break (normal, patch.w);
+        }
+        px -= 1;
+    };
+    (patch.px, patch.text_h) = (px, size.bottom);
+    patch.w = if status { size.right } else { width };
+}
+
+/// Lays the patches out and shows them over the region. No patches hides the overlay.
+fn show_patches(mut patches: Vec<Patch>) {
     UI.with(|ui| unsafe {
-        let panel = ui.panel.get();
-        if text.is_empty() {
-            ShowWindow(panel, SW_HIDE);
+        let overlay = ui.overlay.get();
+        if patches.is_empty() {
+            ShowWindow(overlay, SW_HIDE);
+            ui.patches.borrow_mut().clear();
             return;
         }
-        *ui.text.borrow_mut() = wide(text);
-        SetWindowTextW(panel, wide(&format!("{text}\0")).as_ptr()); // keeps it readable by screen readers
-
         let region = ui.region.get();
-        let rect = RECT { left: region.x, top: region.y, right: region.x + region.w, bottom: region.y + region.h };
-        let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
-        let mut info: MONITORINFO = std::mem::zeroed();
-        info.cbSize = size_of::<MONITORINFO>() as u32;
-        GetMonitorInfoW(monitor, &mut info);
-        let area = info.rcWork;
-
-        let mut current: RECT = std::mem::zeroed();
-        GetWindowRect(panel, &mut current);
-        let placed = ui.placed.get();
-        if !placed {
-            SetWindowPos(panel, null_mut(), rect.left, rect.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(overlay, null_mut(), region.x, region.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        let status_px = STATUS_PX * GetDpiForWindow(overlay) as i32 / 96; // after the move: per monitor
+        let hdc = GetDC(overlay);
+        for patch in &mut patches {
+            fit(hdc, patch, status_px);
         }
-        let (font, pad) = panel_font(panel); // after the move, so the monitor's DPI applies
-        let width = if placed {
-            current.right - current.left
-        } else {
-            let min = PANEL_MIN_WIDTH * GetDpiForWindow(panel) as i32 / 96;
-            region.w.max(min).min(area.right - area.left)
-        };
-        let hdc = GetDC(panel);
-        let old = SelectObject(hdc, font);
-        let mut measure = RECT { left: 0, top: 0, right: width - pad * 2, bottom: 0 };
-        let text16 = ui.text.borrow();
-        DrawTextW(hdc, text16.as_ptr(), text16.len() as i32, &mut measure, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
-        SelectObject(hdc, old);
-        ReleaseDC(panel, hdc);
-        DeleteObject(font);
-        let height = (measure.bottom + pad * 2).min(area.bottom - area.top);
+        ReleaseDC(overlay, hdc);
 
-        let (mut x, mut y) = if placed {
-            (current.left, current.top)
-        } else if rect.bottom + height <= area.bottom {
-            (rect.left, rect.bottom)
-        } else if rect.top - height >= area.top {
-            (rect.left, rect.top - height)
-        } else {
-            (rect.left, rect.bottom - height) // no room outside: lies over the region, which capture ignores
-        };
-        x = x.clamp(area.left, (area.right - width).max(area.left));
-        y = y.clamp(area.top, (area.bottom - height).max(area.top));
-        ui.placed.set(true);
-        SetWindowPos(panel, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        InvalidateRect(panel, null(), 0);
+        let height = patches.iter().map(|p| p.y + p.h).max().unwrap_or(0).max(region.h);
+        let text = patches.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
+        SetWindowTextW(overlay, wide(&format!("{text}\0")).as_ptr()); // keeps it readable by screen readers
+        *ui.patches.borrow_mut() = patches;
+        SetWindowPos(overlay, HWND_TOPMOST, region.x, region.y, region.w, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(overlay, null(), 0);
     });
 }
 
-unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+unsafe fn fill(hdc: HDC, rect: &RECT, color: u32) {
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        FillRect(hdc, rect, brush);
+        DeleteObject(brush);
+    }
+}
+
+unsafe fn paint_overlay(hwnd: HWND) {
+    unsafe {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut client);
+        // Off screen first: drawing straight to the window would flash the original through.
+        let mem = CreateCompatibleDC(hdc);
+        let bitmap = CreateCompatibleBitmap(hdc, client.right, client.bottom);
+        let old_bitmap = SelectObject(mem, bitmap);
+        fill(mem, &client, KEY_COLOR);
+        SetBkMode(mem, TRANSPARENT as i32);
+        UI.with(|ui| {
+            for p in ui.patches.borrow().iter() {
+                fill(mem, &RECT { left: p.x, top: p.y, right: p.x + p.w, bottom: p.y + p.h }, p.bg);
+                let font = text_font(p.px, p.bold);
+                let old_font = SelectObject(mem, font);
+                SetTextColor(mem, p.fg);
+                let top = p.y + (p.h - p.text_h) / 2;
+                // DT_EDITCONTROL drops a last line that overhangs, so the box must hold all of it.
+                let mut area = RECT { left: p.x, top, right: p.x + p.w, bottom: top + p.text_h };
+                let text = wide(&p.text);
+                DrawTextW(mem, text.as_ptr(), text.len() as i32, &mut area, TEXT_FLAGS);
+                SelectObject(mem, old_font);
+                DeleteObject(font);
+            }
+        });
+        BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+    }
+}
+
+unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
-            WM_NCHITTEST => HTCAPTION as LRESULT, // drag anywhere to move
-            WM_NCRBUTTONUP => {
-                stop();
-                0
-            }
             WM_ERASEBKGND => 1,
             WM_PAINT => {
-                let mut ps: PAINTSTRUCT = std::mem::zeroed();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                let mut client: RECT = std::mem::zeroed();
-                GetClientRect(hwnd, &mut client);
-                let brush = CreateSolidBrush(PANEL_BG);
-                FillRect(hdc, &client, brush);
-                DeleteObject(brush);
-                let (font, pad) = panel_font(hwnd);
-                let old = SelectObject(hdc, font);
-                SetBkMode(hdc, TRANSPARENT as i32);
-                SetTextColor(hdc, PANEL_FG);
-                let mut area = RECT { left: pad, top: pad, right: client.right - pad, bottom: client.bottom - pad };
-                UI.with(|ui| {
-                    let text = ui.text.borrow();
-                    if !text.is_empty() {
-                        // Before the first result the pointer is dangling, and DrawTextW reads it even for length 0.
-                        DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut area, DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
-                    }
-                });
-                SelectObject(hdc, old);
-                DeleteObject(font);
-                EndPaint(hwnd, &ps);
+                paint_overlay(hwnd);
                 0
             }
-            WM_TEXT => {
-                let text = Box::from_raw(l as *mut String);
+            WM_PATCHES => {
+                let patches = Box::from_raw(l as *mut Vec<Patch>);
                 if UI.with(|ui| ui.job_id.get()) == w as u64 {
-                    show_text(&text);
+                    show_patches(*patches);
                 }
                 0
             }
@@ -551,29 +573,29 @@ fn main() {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         register_class(w!("ScreenTranslateMain"), Some(main_proc), IDC_ARROW);
         register_class(w!("ScreenTranslateSelect"), Some(select_proc), IDC_CROSS);
-        register_class(w!("ScreenTranslatePanel"), Some(panel_proc), IDC_ARROW);
+        register_class(w!("ScreenTranslateOverlay"), Some(overlay_proc), IDC_ARROW);
 
         let module = GetModuleHandleW(null());
         let main = CreateWindowExW(0, w!("ScreenTranslateMain"), w!("screen-translate"), 0, 0, 0, 0, 0, null_mut(), null_mut(), module, null());
-        let panel = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
-            w!("ScreenTranslatePanel"),
+        let overlay = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            w!("ScreenTranslateOverlay"),
             null(),
             WS_POPUP,
             0,
             0,
-            PANEL_MIN_WIDTH,
-            80,
+            1,
+            1,
             null_mut(),
             null_mut(),
             module,
             null(),
         );
-        SetLayeredWindowAttributes(panel, 0, PANEL_ALPHA, LWA_ALPHA);
-        SetWindowDisplayAffinity(panel, WDA_EXCLUDEFROMCAPTURE); // never OCR our own output
+        SetLayeredWindowAttributes(overlay, KEY_COLOR, 255, LWA_COLORKEY);
+        SetWindowDisplayAffinity(overlay, WDA_EXCLUDEFROMCAPTURE); // never OCR our own output
         UI.with(|ui| {
             ui.main.set(main);
-            ui.panel.set(panel);
+            ui.overlay.set(overlay);
         });
 
         let mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
@@ -586,8 +608,8 @@ fn main() {
         }
         tray_icon(main, NIM_ADD);
 
-        let panel_handle = panel as usize;
-        std::thread::spawn(move || worker(panel_handle));
+        let overlay_handle = overlay as usize;
+        std::thread::spawn(move || worker(overlay_handle));
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
