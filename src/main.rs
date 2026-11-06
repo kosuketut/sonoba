@@ -157,13 +157,22 @@ fn worker(overlay: usize) {
                     translator.unload();
                 }
                 if WARM_UP.swap(false, Ordering::Relaxed) {
-                    models = models.or_else(|| ocr::Ocr::new().ok());
+                    let _ = ensure_ocr(&mut models);
                     translator.warm_up();
                 }
             }
         }
         idle_since = Instant::now();
     }
+}
+
+/// Loads the OCR models, or reloads them if the thread setting has changed.
+fn ensure_ocr(models: &mut Option<ocr::Ocr>) -> Result<(), String> {
+    let threads = config::get().threads();
+    if models.as_ref().is_none_or(|m| m.threads() != threads) {
+        *models = Some(ocr::Ocr::new(threads)?);
+    }
+    Ok(())
 }
 
 fn free_when_idle(since: Instant, models: &mut Option<ocr::Ocr>, translator: &mut translate::Translator) {
@@ -321,9 +330,7 @@ fn translate_frame(
     keep_going: &(impl Fn() -> bool + Sync),
     post: &(impl Fn(Vec<Patch>) + Sync),
 ) -> Result<Vec<Patch>, String> {
-    if models.is_none() {
-        *models = Some(ocr::Ocr::new()?);
-    }
+    ensure_ocr(models)?;
     let Frame { pixels, w, h } = frame;
     let (w, h) = (*w, *h);
     let frame = pixels.as_slice();
@@ -1000,8 +1007,6 @@ unsafe fn register_class(name: *const u16, proc: WNDPROC, cursor: *const u16) {
 }
 
 fn main() {
-    // Half the performance cores: quick enough, and light on whatever else is running.
-    unsafe { std::env::set_var("RTEN_NUM_THREADS", "6") }; // no other thread exists yet
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         register_class(w!("ScreenTranslateMain"), Some(main_proc), IDC_ARROW);

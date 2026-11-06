@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::*;
+use windows_sys::Win32::System::SystemInformation::{
+    GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 pub const URL: &str = "http://127.0.0.1:11437";
@@ -19,7 +22,7 @@ const PORT: &str = "11437";
 pub const SLOTS: usize = 4; // requests at once: twice the speed of one; eight add little
 const CONTEXT_PER_SLOT: usize = 2048;
 const BATCH: &str = "1024";
-const HYBRID_LAYERS: &str = "12";
+const AUTO_GPU_MARGIN_MIB: u64 = 256; // left free for everything else when no limit is set
 
 pub const UNLOADED: u8 = 0;
 pub const LOADING: u8 = 1;
@@ -38,18 +41,55 @@ pub fn wait_until_stopped() {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Device {
+    Auto, // as many layers as fit in GPU memory, the rest on the CPU; no GPU at all works too
     Gpu,
-    Hybrid,
     Cpu,
 }
 
-impl Device {
-    fn gpu_layers(self) -> &'static str {
-        match self {
-            Device::Gpu => "99",
-            Device::Hybrid => HYBRID_LAYERS,
-            Device::Cpu => "0",
+/// Everything about how the engine runs. A change means restarting it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Options {
+    pub device: Device,
+    pub threads: usize,
+    pub gpu_limit_mib: Option<u64>, // Auto only
+}
+
+/// The cores worth computing on: physical ones, and of those the performance cores, since a
+/// thread on an efficiency core holds the others back. One core counts once, however many
+/// hardware threads it has. This fits any machine, so nothing here assumes a core count.
+pub fn performance_cores() -> usize {
+    let fallback = || std::thread::available_parallelism().map_or(1, |n| n.get());
+    unsafe {
+        let mut bytes = 0u32;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut bytes);
+        let mut buffer = vec![0u64; (bytes as usize).div_ceil(8)]; // u64 for the alignment
+        let start = buffer.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
+        if bytes == 0 || GetLogicalProcessorInformationEx(RelationProcessorCore, start, &mut bytes) == 0 {
+            return fallback();
         }
+        let mut classes = Vec::new();
+        let mut offset = 0;
+        while offset < bytes as usize {
+            let info = &*((start as *const u8).add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
+            classes.push(info.Anonymous.Processor.EfficiencyClass);
+            offset += info.Size as usize;
+        }
+        let best = classes.iter().copied().max().unwrap_or(0);
+        Some(classes.iter().filter(|&&class| class == best).count()).filter(|&n| n > 0).unwrap_or_else(fallback)
+    }
+}
+
+/// The MiB a line of `--list-devices` reports free: "Vulkan0: Some GPU (11996 MiB, 11228 MiB free)".
+fn free_mib(listing: &str) -> Option<u64> {
+    let line = listing.lines().find(|line| line.ends_with("MiB free)"))?;
+    line.rsplit(", ").next()?.split(' ').next()?.parse().ok()
+}
+
+/// The engine has no limit on GPU memory, only a margin to leave free, so one becomes the other.
+fn gpu_margin_mib(limit: Option<u64>, free: Option<u64>) -> u64 {
+    match (limit, free) {
+        (Some(limit), Some(free)) => free.saturating_sub(limit),
+        _ => AUTO_GPU_MARGIN_MIB,
     }
 }
 
@@ -85,14 +125,28 @@ pub struct Engine {
 impl Engine {
     /// Starts loading; `ready` tells when it has finished. The job object takes the process
     /// down with the app, however the app ends.
-    pub fn start(model: &Path, device: Device) -> Result<Self, String> {
-        let threads = std::thread::available_parallelism().map_or(4, |n| (n.get() / 3).clamp(2, 8));
-        let child = engine_command(device)?
+    pub fn start(model: &Path, options: Options) -> Result<Self, String> {
+        let device = options.device;
+        let layers = match device {
+            Device::Auto => "auto",
+            Device::Gpu => "all",
+            Device::Cpu => "0",
+        };
+        let mut command = engine_command(device)?;
+        if device == Device::Auto {
+            let free = options.gpu_limit_mib.and_then(|_| {
+                let listing = engine_command(device).ok()?.arg("--list-devices").creation_flags(CREATE_NO_WINDOW).output().ok()?;
+                let text = [listing.stdout, listing.stderr].concat();
+                free_mib(&String::from_utf8_lossy(&text))
+            });
+            command.args(["--fit-target", &gpu_margin_mib(options.gpu_limit_mib, free).to_string()]);
+        }
+        let child = command
             .arg("--model")
             .arg(model)
             .args(["--host", "127.0.0.1", "--port", PORT, "--no-webui", "--offline", "--log-disable"])
             .args(["-c", &(SLOTS * CONTEXT_PER_SLOT).to_string(), "-np", &SLOTS.to_string()])
-            .args(["-b", BATCH, "-ub", BATCH, "-t", &threads.to_string(), "-ngl", device.gpu_layers()])
+            .args(["-b", BATCH, "-ub", BATCH, "-t", &options.threads.to_string(), "-ngl", layers])
             .args(["--cache-ram", "0", "--load-mode", "none"]) // no mapping: a third of the memory
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -115,6 +169,32 @@ impl Engine {
 
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_memory_comes_from_the_device_listing() {
+        let listing = "Available devices:\r\n  Vulkan0: NVIDIA GeForce RTX 4070 Ti (11996 MiB, 11228 MiB free)\r\n";
+        assert_eq!(free_mib(listing), Some(11228));
+        assert_eq!(free_mib("Available devices:\n"), None);
+    }
+
+    #[test]
+    fn a_limit_becomes_the_margin_left_free() {
+        assert_eq!(gpu_margin_mib(Some(1500), Some(11228)), 9728);
+        assert_eq!(gpu_margin_mib(Some(4000), Some(1000)), 0);
+        assert_eq!(gpu_margin_mib(None, Some(11228)), AUTO_GPU_MARGIN_MIB);
+        assert_eq!(gpu_margin_mib(Some(1500), None), AUTO_GPU_MARGIN_MIB);
+    }
+
+    #[test]
+    fn the_core_count_fits_the_machine() {
+        let cores = performance_cores();
+        assert!(cores >= 1 && cores <= std::thread::available_parallelism().unwrap().get());
     }
 }
 

@@ -3,8 +3,9 @@
 
 use crate::patch::{self, Glyphs};
 use rayon::prelude::*;
-use rten::Model;
+use rten::{Model, RunOptions, ThreadPool};
 use rten_tensor::NdTensor;
+use std::sync::Arc;
 
 static DET: &[u8] = include_bytes!("../models/PP-OCRv6_det_small.onnx");
 static REC: &[u8] = include_bytes!("../models/PP-OCRv6_rec_small.onnx");
@@ -89,22 +90,33 @@ pub struct Ocr {
     det: Model,
     rec: Model,
     chars: Vec<&'static str>,
+    pool: Arc<ThreadPool>,
+    threads: usize,
 }
 
 impl Ocr {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(threads: usize) -> Result<Self, String> {
         let load = |b| Model::load_static_slice(b).map_err(|e| e.to_string());
         let mut chars = vec![""]; // class 0 is the CTC blank
         chars.extend(DICT.lines().filter(|s| !s.is_empty())); // git may check dict.txt out as CRLF
         chars.push(" ");
-        Ok(Self { det: load(DET)?, rec: load(REC)?, chars })
+        let pool = Arc::new(ThreadPool::with_num_threads(threads));
+        Ok(Self { det: load(DET)?, rec: load(REC)?, chars, pool, threads })
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    fn run_options(&self) -> Option<RunOptions> {
+        Some(RunOptions::default().with_thread_pool(Some(self.pool.clone())))
     }
 
     pub fn read(&self, bgra: &[u8], w: usize, h: usize) -> Result<Vec<Line>, String> {
         let img = Rgbf::from_bgra_padded(bgra, w, h, PAD);
         let boxes = self.detect(&img)?;
         let lines: Vec<Option<Line>> =
-            rten::thread_pool().run(|| boxes.par_iter().map(|&rect| self.read_line(bgra, &img, (w, h), rect)).collect::<Result<_, _>>())?;
+            self.pool.run(|| boxes.par_iter().map(|&rect| self.read_line(bgra, &img, (w, h), rect)).collect::<Result<_, _>>())?;
         let mut lines: Vec<Line> = lines.into_iter().flatten().collect();
         reading_order(&mut lines);
         Ok(lines)
@@ -130,7 +142,7 @@ impl Ocr {
         let round32 = |v: usize| (((v as f32 * ratio) / 32.0).round() as usize).max(1) * 32;
         let (dw, dh) = (round32(img.w), round32(img.h));
         let input = NdTensor::from_data([1, 3, dh, dw], img.sample_chw((0, 0, img.w, img.h), dw, dh, dw));
-        let out = self.det.run_one(input.into(), None).map_err(|e| e.to_string())?;
+        let out = self.det.run_one(input.into(), self.run_options()).map_err(|e| e.to_string())?;
         let (shape, prob) = out.into_shape_vec::<f32, 4>().map_err(|e| e.to_string())?;
         let (mh, mw) = (shape[2], shape[3]);
         let (sx, sy) = (img.w as f32 / mw as f32, img.h as f32 / mh as f32);
@@ -154,7 +166,7 @@ impl Ocr {
         let width = (bw * REC_HEIGHT).div_ceil(bh).clamp(1, REC_MAX_WIDTH);
         let stride = width.max(REC_MIN_WIDTH);
         let input = NdTensor::from_data([1, 3, REC_HEIGHT, stride], img.sample_chw(rect, width, REC_HEIGHT, stride));
-        let out = self.rec.run_one(input.into(), None).map_err(|e| e.to_string())?;
+        let out = self.rec.run_one(input.into(), self.run_options()).map_err(|e| e.to_string())?;
         let (shape, probs) = out.into_shape_vec::<f32, 3>().map_err(|e| e.to_string())?;
         if shape[2] != self.chars.len() {
             return Err(format!("model has {} classes, dictionary {}", shape[2], self.chars.len()));
@@ -438,7 +450,7 @@ mod tests {
     /// Boxes are taller than the glyphs, so a blank line looks smaller than a line height.
     #[test]
     fn blank_line_separates_paragraphs() {
-        let ocr = Ocr::new().unwrap();
+        let ocr = Ocr::new(4).unwrap();
         let (bgra, w, h) = png_bgra("testdata/paragraphs.png");
         let lines = ocr.read(&bgra, w, h).unwrap();
         let got = paragraphs(&lines);
@@ -448,7 +460,7 @@ mod tests {
 
     #[test]
     fn bold_is_recognised_at_heading_and_body_sizes() {
-        let ocr = Ocr::new().unwrap();
+        let ocr = Ocr::new(4).unwrap();
         let (bgra, w, h) = png_bgra("testdata/weights.png");
         let blocks = paragraphs(&ocr.read(&bgra, w, h).unwrap());
         let got: Vec<_> = blocks
@@ -473,7 +485,7 @@ mod tests {
         const WANT: &str = "The quick update changes how background tasks are scheduled. If your session expires, \
             you'll need to sign in again before saving. Don't close this window until the upload has finished, \
             otherwise the file may be incomplete.";
-        let ocr = Ocr::new().unwrap();
+        let ocr = Ocr::new(4).unwrap();
         for name in ["dark-14px", "game-22px", "mono-13px", "ui-12px", "ui-14px", "web-16px"] {
             let (bgra, w, h) = png_bgra(&format!("testdata/{name}.png"));
             let start = std::time::Instant::now();

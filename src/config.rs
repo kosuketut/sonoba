@@ -1,6 +1,6 @@
 //! Saved settings: one JSON file, rewritten whenever something changes.
 
-use crate::engine::Device;
+use crate::engine::{self, Device, Options};
 use crate::models;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -19,13 +19,21 @@ pub struct Hotkey {
 pub struct Config {
     pub model: String, // a file in the models folder
     pub device: Device,
+    pub cpu_threads: Option<usize>, // None: every performance core
+    pub gpu_limit_mib: Option<u64>, // None: whatever fits
     pub hotkeys: [Hotkey; 3], // one shot, live, clear
 }
 
 impl Default for Config {
     fn default() -> Self {
         let ctrl_alt = |key: char| Hotkey { mods: MOD_CONTROL | MOD_ALT, key: key as u32 };
-        Self { model: models::DEFAULT.to_string(), device: Device::Gpu, hotkeys: [ctrl_alt('T'), ctrl_alt('R'), ctrl_alt('X')] }
+        Self {
+            model: models::DEFAULT.to_string(),
+            device: Device::Auto,
+            cpu_threads: None,
+            gpu_limit_mib: None,
+            hotkeys: [ctrl_alt('T'), ctrl_alt('R'), ctrl_alt('X')],
+        }
     }
 }
 
@@ -39,9 +47,11 @@ impl Config {
         }
         config.device = match saved["device"].as_str() {
             Some("cpu") => Device::Cpu,
-            Some("hybrid") => Device::Hybrid,
-            _ => Device::Gpu,
+            Some("gpu") => Device::Gpu,
+            _ => Device::Auto,
         };
+        config.cpu_threads = saved["cpu_threads"].as_u64().map(|n| (n as usize).max(1));
+        config.gpu_limit_mib = saved["gpu_limit_mib"].as_u64();
         for (slot, name) in config.hotkeys.iter_mut().zip(["once", "live", "clear"]) {
             if let (Some(mods), Some(key)) = (saved[name]["mods"].as_u64(), saved[name]["key"].as_u64()) {
                 *slot = Hotkey { mods: mods as u32, key: key as u32 };
@@ -53,18 +63,28 @@ impl Config {
     fn to_json(&self) -> String {
         let hotkey = |h: &Hotkey| json!({ "mods": h.mods, "key": h.key });
         let device = match self.device {
+            Device::Auto => "auto",
             Device::Gpu => "gpu",
-            Device::Hybrid => "hybrid",
             Device::Cpu => "cpu",
         };
         let saved = json!({
             "model": self.model,
             "device": device,
+            "cpu_threads": self.cpu_threads,
+            "gpu_limit_mib": self.gpu_limit_mib,
             "once": hotkey(&self.hotkeys[0]),
             "live": hotkey(&self.hotkeys[1]),
             "clear": hotkey(&self.hotkeys[2]),
         });
         serde_json::to_string_pretty(&saved).unwrap_or_default()
+    }
+
+    pub fn threads(&self) -> usize {
+        self.cpu_threads.unwrap_or_else(engine::performance_cores).max(1)
+    }
+
+    pub fn engine_options(&self) -> Options {
+        Options { device: self.device, threads: self.threads(), gpu_limit_mib: self.gpu_limit_mib }
     }
 }
 
@@ -97,7 +117,9 @@ mod tests {
     fn settings_survive_a_round_trip() {
         let mut config = Config::default();
         config.model = "custom.gguf".into();
-        config.device = Device::Hybrid;
+        config.device = Device::Cpu;
+        config.cpu_threads = Some(3);
+        config.gpu_limit_mib = Some(1536);
         config.hotkeys[1] = Hotkey { mods: 6, key: 0x70 };
         assert_eq!(Config::parse(&config.to_json()), config);
     }

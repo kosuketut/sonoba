@@ -25,10 +25,24 @@ const ID_STATUS: i32 = 107;
 const ID_MESSAGE: i32 = 108;
 const ID_CLOSE: i32 = 109;
 const ID_HOTKEY: i32 = 110; // and the two after it
+const ID_GPU_LIMIT: i32 = 113;
+const ID_THREADS: i32 = 114;
 const TIMER: usize = 1;
 const TIMER_MS: u32 = 250;
 const HOTKEY_LABELS: [&str; 3] = ["範囲を 1 回翻訳", "リアルタイム翻訳", "訳文を消す"];
-const DEVICES: [(&str, Device); 3] = [("GPU", Device::Gpu), ("CPU と GPU の併用", Device::Hybrid), ("CPU", Device::Cpu)];
+const DEVICES: [(&str, Device); 3] =
+    [("自動（GPU メモリに載る分を GPU で、残りを CPU で実行）", Device::Auto), ("GPU のみ", Device::Gpu), ("CPU のみ", Device::Cpu)];
+const GPU_LIMITS: [(&str, Option<u64>); 9] = [
+    ("制限なし", None),
+    ("0.5GB", Some(512)),
+    ("1GB", Some(1024)),
+    ("1.5GB", Some(1536)),
+    ("2GB", Some(2048)),
+    ("3GB", Some(3072)),
+    ("4GB", Some(4096)),
+    ("6GB", Some(6144)),
+    ("8GB", Some(8192)),
+];
 const FONT_PX: i32 = 14;
 const LICENSE_QUESTION: &str = "PLaMo 3 Translate は PLaMo コミュニティライセンスで提供されています。\n\
     ダウンロードして使うと、この契約に同意したことになります。\n\
@@ -129,6 +143,7 @@ fn refresh(window: HWND) {
     enable(window, ID_DELETE, present && !downloading);
     enable(window, ID_LOAD, present && !downloading && state == engine::UNLOADED);
     enable(window, ID_UNLOAD, state != engine::UNLOADED);
+    enable(window, ID_GPU_LIMIT, config::get().device == Device::Auto);
 }
 
 fn read_hotkey(control: HWND) -> Option<Hotkey> {
@@ -191,6 +206,16 @@ fn on_command(window: HWND, id: i32, code: u32) {
             if let Some((_, device)) = DEVICES.get(index) {
                 choice_changed(window, |c| c.device = *device);
             }
+        }
+        (ID_GPU_LIMIT, CBN_SELCHANGE) => {
+            let index = unsafe { SendMessageW(control(window, ID_GPU_LIMIT), CB_GETCURSEL, 0, 0) } as usize;
+            if let Some((_, limit)) = GPU_LIMITS.get(index) {
+                choice_changed(window, |c| c.gpu_limit_mib = *limit);
+            }
+        }
+        (ID_THREADS, CBN_SELCHANGE) => {
+            let index = unsafe { SendMessageW(control(window, ID_THREADS), CB_GETCURSEL, 0, 0) } as usize;
+            choice_changed(window, |c| c.cpu_threads = (index > 0).then_some(index));
         }
         (ID_DOWNLOAD, BN_CLICKED) => {
             set_text(window, ID_MESSAGE, "");
@@ -294,7 +319,7 @@ pub fn open() {
         WINDOW.set(hwnd);
         let dpi = GetDpiForWindow(hwnd) as i32;
         let s = |v: i32| v * dpi / 96;
-        let mut outer = RECT { left: 0, top: 0, right: s(560), bottom: s(372) };
+        let mut outer = RECT { left: 0, top: 0, right: s(560), bottom: s(444) };
         AdjustWindowRectExForDpi(&mut outer, style, 0, 0, dpi as u32);
         SetWindowPos(hwnd, null_mut(), 0, 0, outer.right - outer.left, outer.bottom - outer.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         FONT.set(CreateFontW(
@@ -326,25 +351,43 @@ pub fn open() {
 
         add(hwnd, w!("STATIC"), "実行方法", 0, -1, (20, 130, 110, 22));
         add(hwnd, w!("COMBOBOX"), "", combo, ID_DEVICE, (136, 126, 404, 200));
-        let device = config::get().device;
+        let config = config::get();
         for (label, _) in DEVICES {
             SendMessageW(control(hwnd, ID_DEVICE), CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
         }
-        let selected = DEVICES.iter().position(|(_, d)| *d == device).unwrap_or(0);
+        let selected = DEVICES.iter().position(|(_, d)| *d == config.device).unwrap_or(0);
         SendMessageW(control(hwnd, ID_DEVICE), CB_SETCURSEL, selected, 0);
 
-        let hotkeys = config::get().hotkeys;
+        add(hwnd, w!("STATIC"), "GPU メモリ上限", 0, -1, (20, 166, 110, 22));
+        add(hwnd, w!("COMBOBOX"), "", combo, ID_GPU_LIMIT, (136, 162, 200, 260));
+        for (label, _) in GPU_LIMITS {
+            SendMessageW(control(hwnd, ID_GPU_LIMIT), CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+        }
+        let selected = GPU_LIMITS.iter().position(|(_, l)| *l == config.gpu_limit_mib).unwrap_or(0);
+        SendMessageW(control(hwnd, ID_GPU_LIMIT), CB_SETCURSEL, selected, 0);
+
+        add(hwnd, w!("STATIC"), "CPU スレッド数", 0, -1, (20, 202, 110, 22));
+        add(hwnd, w!("COMBOBOX"), "", combo, ID_THREADS, (136, 198, 200, 260));
+        let thread_box = control(hwnd, ID_THREADS);
+        let auto = wide(&format!("自動（{}）", engine::performance_cores()));
+        SendMessageW(thread_box, CB_ADDSTRING, 0, auto.as_ptr() as isize);
+        for n in 1..=std::thread::available_parallelism().map_or(1, |n| n.get()) {
+            SendMessageW(thread_box, CB_ADDSTRING, 0, wide(&n.to_string()).as_ptr() as isize);
+        }
+        SendMessageW(thread_box, CB_SETCURSEL, config.cpu_threads.unwrap_or(0), 0);
+
+        let hotkeys = config.hotkeys;
         for (i, label) in HOTKEY_LABELS.iter().enumerate() {
-            let y = 172 + i as i32 * 36;
+            let y = 244 + i as i32 * 36;
             add(hwnd, w!("STATIC"), label, 0, -1, (20, y + 4, 110, 22));
             let id = ID_HOTKEY + i as i32;
             let box_ = add(hwnd, HOTKEY_CLASSW, "", WS_TABSTOP | WS_BORDER, id, (136, y, 220, 26));
             SendMessageW(box_, HKM_SETRULES, (HKCOMB_NONE | HKCOMB_S) as usize, (HOTKEYF_CONTROL | HOTKEYF_ALT) as isize);
             write_hotkey(box_, hotkeys[i]);
         }
-        add(hwnd, w!("STATIC"), "", 0, ID_MESSAGE, (20, 288, 520, 24));
-        add(hwnd, w!("STATIC"), "Built with PLaMo", 0, -1, (20, 328, 200, 22));
-        add(hwnd, w!("BUTTON"), "閉じる", button, ID_CLOSE, (440, 322, 100, 32));
+        add(hwnd, w!("STATIC"), "", 0, ID_MESSAGE, (20, 360, 520, 24));
+        add(hwnd, w!("STATIC"), "Built with PLaMo", 0, -1, (20, 400, 200, 22));
+        add(hwnd, w!("BUTTON"), "閉じる", button, ID_CLOSE, (440, 394, 100, 32));
 
         fill_models(hwnd);
         refresh(hwnd);

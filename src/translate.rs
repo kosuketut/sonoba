@@ -1,7 +1,7 @@
 //! Translation into Japanese with whichever model is selected.
 
 use crate::config;
-use crate::engine::{self, Device, Engine, SLOTS, URL};
+use crate::engine::{self, Engine, Options, SLOTS, URL};
 use crate::models::{self, Format};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ pub struct Translator {
     agent: ureq::Agent,
     cache: Mutex<HashMap<String, String>>,
     engine: Option<Engine>,
-    running: Option<(String, Device)>,
+    running: Option<(String, Options)>,
 }
 
 impl Translator {
@@ -33,7 +33,8 @@ impl Translator {
 
     fn ensure_engine(&mut self) -> Result<(), String> {
         let config = config::get();
-        let wanted = (config.model, config.device);
+        let options = config.engine_options();
+        let wanted = (config.model, options);
         if self.engine.as_mut().is_some_and(Engine::is_alive) && self.running.as_ref() == Some(&wanted) {
             return Ok(());
         }
