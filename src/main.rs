@@ -16,7 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -27,10 +27,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
 const POLL: Duration = Duration::from_millis(150);
-const PARTIAL_AFTER: Duration = Duration::from_millis(300); // show finished paragraphs of long pages
 const OCR_IDLE: Duration = Duration::from_secs(60); // free the OCR models this long after the last job
 const MIN_SELECTION: i32 = 8;
-const MIN_TEXT_PX: i32 = 11; // below this Japanese stops being legible; the patch grows instead
+const MIN_TEXT_PX: i32 = 9; // below this Japanese stops being legible; the patch grows instead
+const BATCH_CHARS: usize = 500; // one request at a time, so a long page fills in as it goes
+const MIN_HISTORY_WORDS: usize = 4; // labels make poor context for the paragraph after them
 const STATUS_PX: i32 = 16;
 
 const HK_ONCE: i32 = 1;
@@ -141,23 +142,31 @@ fn translate_frame(
     let (w, h) = (job.region.w as usize, job.region.h as usize);
     let lines = models.as_ref().unwrap().read(frame, w, h)?;
     let blocks = ocr::paragraphs(&lines);
-    let (mut out, mut history, mut last_post) = (Vec::new(), Vec::new(), Instant::now());
-    for (i, block) in blocks.iter().enumerate() {
-        if ocr::looks_like_code(&block.text) {
-            continue;
+    let blocks: Vec<&ocr::Block> = blocks.iter().filter(|b| !ocr::looks_like_code(&b.text)).collect();
+    let (mut out, mut history): (Vec<Patch>, Vec<(String, String)>) = (Vec::new(), Vec::new());
+    let mut start = 0;
+    while start < blocks.len() && is_current(job.id) {
+        let mut end = start + 1;
+        let mut chars = blocks[start].text.len();
+        while end < blocks.len() && chars + blocks[end].text.len() <= BATCH_CHARS {
+            chars += blocks[end].text.len();
+            end += 1;
         }
-        let text = translator.translate(&block.text, &history[history.len().saturating_sub(translate::HISTORY)..])?;
-        if !is_current(job.id) {
-            break;
+        let texts: Vec<&str> = blocks[start..end].iter().map(|b| b.text.as_str()).collect();
+        let recent = &history[history.len().saturating_sub(translate::HISTORY)..];
+        let translations = translator.translate_all(&texts, recent)?;
+        for (block, text) in blocks[start..end].iter().zip(translations) {
+            // Numbers, code and the like come back unchanged: leave the original on show.
+            if text.to_lowercase() != block.text.to_lowercase() {
+                if block.text.split(' ').count() >= MIN_HISTORY_WORDS {
+                    history.push((block.text.clone(), text.clone()));
+                }
+                out.push(Patch::new(frame, w, h, block, text));
+            }
         }
-        // Numbers, code and the like come back unchanged: leave the original on show.
-        if text.to_lowercase() != block.text.to_lowercase() {
-            history.push((block.text.clone(), text.clone()));
-            out.extend(Patch::new(frame, w, h, block, text));
-        }
-        if last_post.elapsed() > PARTIAL_AFTER && i + 1 < blocks.len() {
+        start = end;
+        if start < blocks.len() {
             post(out.clone());
-            last_post = Instant::now();
         }
     }
     if out.is_empty() && !job.live {
@@ -221,6 +230,7 @@ unsafe fn begin_select(live: bool) {
             return;
         }
         stop();
+        std::thread::spawn(translate::warm_up); // ready by the time the drag ends
         ui.live_next.set(live);
         let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
         let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
@@ -283,6 +293,7 @@ unsafe fn finish_select(hwnd: HWND) {
         ui.region.set(region);
         ui.job_id.set(id);
         ui.live.set(live);
+        SetWindowDisplayAffinity(ui.overlay.get(), WDA_EXCLUDEFROMCAPTURE); // never OCR our own output
         show_patches(vec![Patch::status(WORKING, region.w)]);
         set_job(Some(Job { region, live, id }));
     });
@@ -365,8 +376,9 @@ unsafe fn text_font(px: i32, bold: bool) -> HFONT {
 
 const TEXT_FLAGS: DRAW_TEXT_FORMAT = DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL;
 
-/// Picks the largest font that keeps the text inside the patch, starting from the height of
-/// the original lines, and grows the patch only when even MIN_TEXT_PX does not fit.
+/// Keeps the original font size if the text fits, spreading one line over empty background
+/// first and shrinking only after that. Overhanging leading is empty, so it does not count,
+/// and the patch grows only when even MIN_TEXT_PX does not fit.
 unsafe fn fit(hdc: HDC, patch: &mut Patch, status_px: i32) {
     let text = wide(&patch.text);
     let measure = |px: i32, width: i32| unsafe {
@@ -379,9 +391,10 @@ unsafe fn fit(hdc: HDC, patch: &mut Patch, status_px: i32) {
         rect
     };
     let status = patch.h == 0;
-    let mut px = if status { status_px } else { (patch.h / patch.lines).max(MIN_TEXT_PX) };
+    let mut px = if status { status_px } else { patch.em.max(1) };
+    let smallest = MIN_TEXT_PX.min(px);
     let (size, width) = loop {
-        let room = patch.h + px / 3; // the last line's leading is empty, so it may stick out
+        let room = patch.h + px / 2;
         let normal = measure(px, patch.w);
         if normal.bottom <= room {
             break (normal, patch.w);
@@ -390,7 +403,7 @@ unsafe fn fit(hdc: HDC, patch: &mut Patch, status_px: i32) {
         if spread.bottom <= room {
             break (spread, patch.w.max(spread.right + 1));
         }
-        if status || px <= MIN_TEXT_PX {
+        if status || px <= smallest {
             patch.h = normal.bottom;
             break (normal, patch.w);
         }
@@ -435,6 +448,28 @@ unsafe fn fill(hdc: HDC, rect: &RECT, color: u32) {
     }
 }
 
+unsafe fn draw_patches(hdc: HDC, patches: &[Patch]) {
+    unsafe {
+        SetBkMode(hdc, TRANSPARENT as i32);
+        for p in patches {
+            fill(hdc, &RECT { left: p.x, top: p.y, right: p.x + p.w, bottom: p.y + p.h }, p.bg);
+        }
+        // A second pass, so no patch can paint over the text of the one before it.
+        for p in patches {
+            let font = text_font(p.px, p.bold);
+            let old_font = SelectObject(hdc, font);
+            SetTextColor(hdc, p.fg);
+            let top = p.y + (p.h - p.text_h) / 2;
+            // DT_EDITCONTROL drops a last line that overhangs, so the box must hold all of it.
+            let mut area = RECT { left: p.x, top, right: p.x + p.w, bottom: top + p.text_h };
+            let text = wide(&p.text);
+            DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut area, TEXT_FLAGS);
+            SelectObject(hdc, old_font);
+            DeleteObject(font);
+        }
+    }
+}
+
 unsafe fn paint_overlay(hwnd: HWND) {
     unsafe {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -446,22 +481,7 @@ unsafe fn paint_overlay(hwnd: HWND) {
         let bitmap = CreateCompatibleBitmap(hdc, client.right, client.bottom);
         let old_bitmap = SelectObject(mem, bitmap);
         fill(mem, &client, KEY_COLOR);
-        SetBkMode(mem, TRANSPARENT as i32);
-        UI.with(|ui| {
-            for p in ui.patches.borrow().iter() {
-                fill(mem, &RECT { left: p.x, top: p.y, right: p.x + p.w, bottom: p.y + p.h }, p.bg);
-                let font = text_font(p.px, p.bold);
-                let old_font = SelectObject(mem, font);
-                SetTextColor(mem, p.fg);
-                let top = p.y + (p.h - p.text_h) / 2;
-                // DT_EDITCONTROL drops a last line that overhangs, so the box must hold all of it.
-                let mut area = RECT { left: p.x, top, right: p.x + p.w, bottom: top + p.text_h };
-                let text = wide(&p.text);
-                DrawTextW(mem, text.as_ptr(), text.len() as i32, &mut area, TEXT_FLAGS);
-                SelectObject(mem, old_font);
-                DeleteObject(font);
-            }
-        });
+        UI.with(|ui| draw_patches(mem, &ui.patches.borrow()));
         BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old_bitmap);
         DeleteObject(bitmap);
@@ -482,6 +502,10 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 let patches = Box::from_raw(l as *mut Vec<Patch>);
                 if UI.with(|ui| ui.job_id.get()) == w as u64 {
                     show_patches(*patches);
+                    if !UI.with(|ui| ui.live.get()) {
+                        // One shot has read the screen already, so screenshots may show the result.
+                        SetWindowDisplayAffinity(hwnd, WDA_NONE);
+                    }
                 }
                 0
             }
@@ -567,8 +591,8 @@ unsafe fn register_class(name: *const u16, proc: WNDPROC, cursor: *const u16) {
 }
 
 fn main() {
-    // shortcut: a fixed four threads; raise it if OCR must keep up with whole-screen regions.
-    unsafe { std::env::set_var("RTEN_NUM_THREADS", "4") }; // no other thread exists yet
+    // Half the performance cores: quick enough, and light on whatever else is running.
+    unsafe { std::env::set_var("RTEN_NUM_THREADS", "6") }; // no other thread exists yet
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         register_class(w!("ScreenTranslateMain"), Some(main_proc), IDC_ARROW);
@@ -592,7 +616,6 @@ fn main() {
             null(),
         );
         SetLayeredWindowAttributes(overlay, KEY_COLOR, 255, LWA_COLORKEY);
-        SetWindowDisplayAffinity(overlay, WDA_EXCLUDEFROMCAPTURE); // never OCR our own output
         UI.with(|ui| {
             ui.main.set(main);
             ui.overlay.set(overlay);
@@ -615,5 +638,57 @@ fn main() {
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Draws the overlay onto a picture, to judge a layout without touching the real screen:
+    /// RENDER_IN=in.png RENDER_OUT=out.png cargo test render_picture -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs Ollama and a picture"]
+    fn render_picture() {
+        let (input, output) = (std::env::var("RENDER_IN").unwrap(), std::env::var("RENDER_OUT").unwrap());
+        let (mut bgra, w, h) = ocr::png_bgra(&input);
+        let region = Region { x: 0, y: 0, w: w as i32, h: h as i32 };
+        let job = Job { region, live: false, id: 1 };
+        set_job(Some(job));
+        let (mut models, mut translator) = (None, translate::Translator::new());
+        let start = std::time::Instant::now();
+        let mut patches = translate_frame(&bgra, job, &mut models, &mut translator, &|_| {}).unwrap();
+        println!("first pass {:?}", start.elapsed());
+        let start = std::time::Instant::now();
+        translate_frame(&bgra, job, &mut models, &mut translator, &|_| {}).unwrap();
+        println!("second pass, translations cached {:?}", start.elapsed());
+        unsafe {
+            let mem = CreateCompatibleDC(null_mut());
+            let mut info: BITMAPINFO = std::mem::zeroed();
+            info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = w as i32;
+            info.bmiHeader.biHeight = -(h as i32);
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            let mut bits = null_mut();
+            let dib = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            SelectObject(mem, dib);
+            std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+            for patch in &mut patches {
+                fit(mem, patch, STATUS_PX);
+            }
+            for p in &patches {
+                println!("{},{} {}x{} em={} px={} bold={} {}", p.x, p.y, p.w, p.h, p.em, p.px, p.bold, p.text);
+            }
+            draw_patches(mem, &patches);
+            GdiFlush();
+            std::ptr::copy_nonoverlapping(bits as *const u8, bgra.as_mut_ptr(), bgra.len());
+        }
+        let rgb: Vec<u8> = bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+        let file = std::io::BufWriter::new(std::fs::File::create(output).unwrap());
+        let mut encoder = png::Encoder::new(file, w as u32, h as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&rgb).unwrap();
     }
 }

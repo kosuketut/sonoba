@@ -1,7 +1,8 @@
 //! PP-OCRv6 small: DB text detection, then CTC recognition, both on the CPU.
 //! The values below match RapidOCR's PP-OCRv6 config so results stay comparable.
 
-use crate::patch;
+use crate::patch::{self, Glyphs};
+use rayon::prelude::*;
 use rten::Model;
 use rten_tensor::NdTensor;
 
@@ -17,18 +18,14 @@ const DET_THRESH: f32 = 0.3;
 const BOX_THRESH: f32 = 0.5;
 const UNCLIP_RATIO: f32 = 1.6;
 const REC_HEIGHT: usize = 48;
-const REC_MIN_WIDTH: usize = 320;
+const REC_MIN_WIDTH: usize = 160;
 const REC_MAX_WIDTH: usize = 3200;
 const TEXT_SCORE: f32 = 0.5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Line {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
+    pub glyphs: Glyphs,
     pub text: String,
-    pub style: ([i32; 3], [i32; 3]),
 }
 
 /// A BGR image with values already in the -1..1 range the models expect.
@@ -105,17 +102,28 @@ impl Ocr {
 
     pub fn read(&self, bgra: &[u8], w: usize, h: usize) -> Result<Vec<Line>, String> {
         let img = Rgbf::from_bgra_padded(bgra, w, h, PAD);
-        let mut lines = Vec::new();
-        for (x, y, bw, bh) in self.detect(&img)? {
-            let text = self.recognize(&img, (x, y, bw, bh))?;
-            if !text.is_empty() {
-                let (lx, ly, lw, lh) = (x as i32 - PAD as i32, y as i32 - PAD as i32, bw as i32, bh as i32);
-                let style = patch::palette(bgra, w, h, lx, ly, lw, lh);
-                lines.push(Line { x: lx, y: ly, w: lw, h: lh, text, style });
-            }
-        }
+        let boxes = self.detect(&img)?;
+        let lines: Vec<Option<Line>> =
+            rten::thread_pool().run(|| boxes.par_iter().map(|&rect| self.read_line(bgra, &img, (w, h), rect)).collect::<Result<_, _>>())?;
+        let mut lines: Vec<Line> = lines.into_iter().flatten().collect();
         reading_order(&mut lines);
+        separate_touching_lines(&mut lines);
         Ok(lines)
+    }
+
+    fn read_line(&self, bgra: &[u8], img: &Rgbf, (w, h): (usize, usize), rect: (usize, usize, usize, usize)) -> Result<Option<Line>, String> {
+        let (x, y, bw, bh) = rect;
+        let in_frame = (x as i32 - PAD as i32, y as i32 - PAD as i32, bw as i32, bh as i32);
+        let Some(ink) = patch::glyphs(bgra, w, h, in_frame, None) else { return Ok(None) };
+        // Ink from the lines above and below sinks the recogniser's confidence, so crop it off.
+        let margin = (ink.h / 2) as usize;
+        let top = ((ink.y + PAD as i32) as usize).saturating_sub(margin).max(y);
+        let bottom = ((ink.y + ink.h + PAD as i32) as usize + margin).min(y + bh);
+        let text = self.recognize(img, (x, top, bw, bottom - top))?;
+        let first_word = text.split(' ').next().unwrap_or("");
+        Ok(patch::glyphs(bgra, w, h, in_frame, Some(first_word))
+            .filter(|_| !text.is_empty())
+            .map(|glyphs| Line { glyphs, text: without_icon(text.clone(), glyphs.icon) }))
     }
 
     fn detect(&self, img: &Rgbf) -> Result<Vec<(usize, usize, usize, usize)>, String> {
@@ -217,31 +225,57 @@ fn ctc_decode(probs: &[f32], classes: usize, chars: &[&str]) -> String {
     if n == 0.0 || sum / n < TEXT_SCORE { String::new() } else { text.trim().to_string() }
 }
 
+/// The recogniser reads an icon as a stray character or two, such as a circled digit.
+fn without_icon(text: String, icon: bool) -> String {
+    match text.split_once(' ') {
+        Some((first, rest)) if icon && first.chars().count() <= 2 => rest.to_string(),
+        _ => text,
+    }
+}
+
 /// Puts lines of a same-row group into left-to-right order, keeping rows top to bottom.
 fn reading_order(lines: &mut [Line]) {
-    lines.sort_by_key(|l| (l.y, l.x));
+    lines.sort_by_key(|l| (l.glyphs.y, l.glyphs.x));
     for i in 1..lines.len() {
         let mut j = i;
-        while j > 0 && same_row(&lines[j - 1], &lines[j]) && lines[j].x < lines[j - 1].x {
+        while j > 0 && same_row(&lines[j - 1].glyphs, &lines[j].glyphs) && lines[j].glyphs.x < lines[j - 1].glyphs.x {
             lines.swap(j - 1, j);
             j -= 1;
         }
     }
 }
 
-fn same_row(a: &Line, b: &Line) -> bool {
+fn same_row(a: &Glyphs, b: &Glyphs) -> bool {
     let overlap = (a.y + a.h).min(b.y + b.h) - a.y.max(b.y);
     overlap * 2 > a.h.min(b.h)
 }
 
-/// One paragraph and the rectangle it occupies in the image.
+/// With no blank row between two lines their ink counts as one band, and the upper line gets
+/// the height of both. The lower line's top is where it really ends.
+fn separate_touching_lines(lines: &mut [Line]) {
+    for i in 1..lines.len() {
+        let (a, b) = (lines[i - 1].glyphs, lines[i].glyphs);
+        let same_column = (a.x + a.w).min(b.x + b.w) > a.x.max(b.x);
+        if same_column && b.y > a.y && b.y < a.y + a.h {
+            lines[i - 1].glyphs.h = b.y - a.y;
+        }
+    }
+}
+
+/// The font size that gives a line this much ink, going by which parts of the letters the
+/// text uses: "same" fills only the x-height, "Sign" also reaches up and down.
+fn font_size(ink_h: i32, text: &str) -> f32 {
+    let tall = text.chars().any(|c| c.is_uppercase() || c.is_ascii_digit() || "bdfhiklt".contains(c) || !c.is_ascii());
+    let deep = text.chars().any(|c| "gjpqy,;()".contains(c) || !c.is_ascii());
+    ink_h as f32 / (if tall { 0.72 } else { 0.52 } + if deep { 0.21 } else { 0.0 })
+}
+
+/// One paragraph, with its lines' combined ink.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
+    pub glyphs: Glyphs,
     pub lines: i32,
+    pub em: i32,
     pub text: String,
 }
 
@@ -249,8 +283,10 @@ pub struct Block {
 pub fn paragraphs(lines: &[Line]) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::new();
     let mut prev: Option<&Line> = None;
+    let mut em_sum = 0.0;
     for line in lines {
-        match out.last_mut().filter(|b| prev.is_some_and(|a| continues(a, line, b.x + b.w))) {
+        let (g, em) = (&line.glyphs, font_size(line.glyphs.h, &line.text));
+        match out.last_mut().filter(|b| prev.is_some_and(|a| continues(a, line, b.glyphs.x + b.glyphs.w))) {
             Some(block) => {
                 let hyphen = block.text.ends_with('-') && line.text.starts_with(|c: char| c.is_lowercase());
                 if hyphen {
@@ -259,12 +295,18 @@ pub fn paragraphs(lines: &[Line]) -> Vec<Block> {
                     block.text.push(' ');
                 }
                 block.text.push_str(&line.text);
-                let (right, bottom) = ((block.x + block.w).max(line.x + line.w), (block.y + block.h).max(line.y + line.h));
-                (block.x, block.y) = (block.x.min(line.x), block.y.min(line.y));
-                (block.w, block.h) = (right - block.x, bottom - block.y);
+                let b = &mut block.glyphs;
+                let (right, bottom) = ((b.x + b.w).max(g.x + g.w), (b.y + b.h).max(g.y + g.h));
+                (b.x, b.y) = (b.x.min(g.x), b.y.min(g.y));
+                (b.w, b.h) = (right - b.x, bottom - b.y);
                 block.lines += 1;
+                em_sum += em;
+                block.em = (em_sum / block.lines as f32).round() as i32;
             }
-            None => out.push(Block { x: line.x, y: line.y, w: line.w, h: line.h, lines: 1, text: line.text.clone() }),
+            None => {
+                em_sum = em;
+                out.push(Block { glyphs: *g, lines: 1, em: em.round() as i32, text: line.text.clone() });
+            }
         }
         prev = Some(line);
     }
@@ -278,32 +320,52 @@ pub fn looks_like_code(text: &str) -> bool {
 }
 
 /// True when `b` carries on the paragraph that `a` ended, wrapped by the layout.
-fn continues(a: &Line, b: &Line, para_right: i32) -> bool {
+fn continues(line_a: &Line, line_b: &Line, para_right: i32) -> bool {
+    let (a, b) = (&line_a.glyphs, &line_b.glyphs);
     let h = a.h.max(b.h);
     let gap = b.y - (a.y + a.h);
-    let similar_height = (a.h - b.h).abs() * 4 <= h;
+    let similar_height = (a.h - b.h).abs() * 3 <= h;
     let same_column = (a.x + a.w).min(b.x + b.w) > a.x.max(b.x);
-    if same_row(a, b) || gap * 5 > h * 2 || !similar_height || !same_column || !patch::same_style(&a.style, &b.style) {
+    if same_row(a, b) || gap * 10 > h * 11 || !similar_height || !same_column || !a.same_style(b) {
         return false;
     }
-    if b.text.starts_with(|c: char| c.is_lowercase()) {
+    if line_b.text.starts_with(|c: char| c.is_lowercase()) {
         return true;
     }
-    if a.text.split(' ').count() < 4 {
+    if line_a.text.split(' ').count() < 4 {
         return false; // menu items and labels, not wrapped prose
     }
     // A hard line break: b's first word would have fitted on a, so nothing forced a wrap.
-    let first_word = b.text.split(' ').next().unwrap_or("").chars().count() + 1;
-    let word_w = b.w * first_word as i32 / b.text.chars().count().max(1) as i32;
+    let first_word = line_b.text.split(' ').next().unwrap_or("").chars().count() + 1;
+    let word_w = b.w * first_word as i32 / line_b.text.chars().count().max(1) as i32;
     a.x + a.w + word_w > para_right.max(b.x + b.w)
+}
+
+#[cfg(test)]
+pub fn png_bgra(path: &str) -> (Vec<u8>, usize, usize) {
+    let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+        .read_info()
+        .unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    let ch = info.color_type.samples();
+    let bgra = buf[..info.buffer_size()]
+        .chunks_exact(ch)
+        .flat_map(|p| [p[2], p[1], p[0], 255])
+        .collect();
+    (bgra, info.width as usize, info.height as usize)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn at(x: i32, y: i32, w: i32, h: i32, text: &str) -> Line {
+        Line { glyphs: Glyphs { x, y, w, h, bg: [0; 3], fg: [255; 3], stem: 2, icon: false }, text: text.into() }
+    }
+
     fn l(x: i32, y: i32, w: i32, text: &str) -> Line {
-        Line { x, y, w, h: 20, text: text.into(), style: ([0; 3], [0; 3]) }
+        at(x, y, w, 18, text)
     }
 
     #[test]
@@ -312,26 +374,44 @@ mod tests {
         let joined = paragraphs(&wrapped);
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].text, "The quick update changes how tasks are scheduled.");
-        assert_eq!((joined[0].x, joined[0].y, joined[0].w, joined[0].h, joined[0].lines), (0, 0, 500, 44, 2));
+        let g = joined[0].glyphs;
+        assert_eq!((g.x, g.y, g.w, g.h, joined[0].lines), (0, 0, 500, 42, 2));
 
         let menu = [l(0, 0, 60, "Sign in"), l(0, 24, 80, "Settings"), l(0, 48, 300, "About this application")];
         assert_eq!(paragraphs(&menu).len(), 3);
 
-        let far = [l(0, 0, 500, "First paragraph ends here."), l(0, 80, 400, "Second one starts.")];
+        let far = [l(0, 0, 500, "First paragraph ends here."), l(0, 48, 400, "Second one starts.")];
         assert_eq!(paragraphs(&far).len(), 2);
-
-        // Detector boxes are 30px tall here, so one blank line leaves a gap of only 20.
-        let tall = |y, w, text: &str| Line { x: 0, y, w, h: 30, text: text.into(), style: ([0; 3], [0; 3]) };
-        let blank_line = [tall(123, 980, "before saving, otherwise the file may be incomplete."), tall(173, 975, "Press any key")];
-        assert_eq!(paragraphs(&blank_line).len(), 2);
 
         let columns = [l(0, 0, 100, "Name"), l(400, 0, 100, "Value")];
         assert_eq!(paragraphs(&columns).len(), 2);
 
         // A lowercase start is no reason to join text onto a differently coloured panel.
         let mut code = l(0, 24, 300, "python");
-        code.style = ([35, 31, 27], [180, 180, 180]);
+        code.glyphs.bg = [35, 31, 27];
         assert_eq!(paragraphs(&[l(0, 0, 500, "pay more for the output."), code]).len(), 2);
+    }
+
+    #[test]
+    fn touching_lines_get_their_own_heights() {
+        let mut lines = [at(10, 100, 70, 22, "Unlimited"), at(20, 111, 80, 12, "Active subscription")];
+        separate_touching_lines(&mut lines);
+        assert_eq!(lines[0].glyphs.h, 11);
+    }
+
+    #[test]
+    fn an_icon_read_as_text_is_dropped() {
+        assert_eq!(without_icon("② personal".into(), true), "personal");
+        assert_eq!(without_icon("Q Search snippets".into(), true), "Search snippets");
+        assert_eq!(without_icon("Projects".into(), true), "Projects");
+        assert_eq!(without_icon("A shortcut".into(), false), "A shortcut");
+    }
+
+    #[test]
+    fn font_size_allows_for_the_letters_in_the_line() {
+        assert_eq!(font_size(14, "Sign in").round(), 15.0);
+        assert_eq!(font_size(11, "HELLO").round(), 15.0);
+        assert_eq!(font_size(8, "same").round(), 15.0);
     }
 
     #[test]
@@ -375,20 +455,6 @@ mod tests {
         assert_eq!(ctc_decode(&[0.3, 0.4, 0.3], 3, &["", "a", "b"]), "");
     }
 
-    fn png_bgra(path: &str) -> (Vec<u8>, usize, usize) {
-        let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
-            .read_info()
-            .unwrap();
-        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
-        let info = reader.next_frame(&mut buf).unwrap();
-        let ch = info.color_type.samples();
-        let bgra = buf[..info.buffer_size()]
-            .chunks_exact(ch)
-            .flat_map(|p| [p[2], p[1], p[0], 255])
-            .collect();
-        (bgra, info.width as usize, info.height as usize)
-    }
-
     /// Boxes are taller than the glyphs, so a blank line looks smaller than a line height.
     #[test]
     fn blank_line_separates_paragraphs() {
@@ -404,11 +470,10 @@ mod tests {
     fn bold_is_recognised_at_heading_and_body_sizes() {
         let ocr = Ocr::new().unwrap();
         let (bgra, w, h) = png_bgra("testdata/weights.png");
-        let raw = ocr.read(&bgra, w, h).unwrap();
-        let blocks = paragraphs(&raw);
+        let blocks = paragraphs(&ocr.read(&bgra, w, h).unwrap());
         let got: Vec<_> = blocks
             .iter()
-            .map(|b| (b.text.as_str(), patch::Patch::new(&bgra, w, h, b, b.text.clone()).unwrap().bold))
+            .map(|b| (b.text.as_str(), b.glyphs.bold()))
             .collect();
         assert_eq!(
             got,

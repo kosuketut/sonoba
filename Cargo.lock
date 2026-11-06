@@ -344,6 +344,7 @@ name = "screen-translate"
 version = "0.1.0"
 dependencies = [
  "png",
+ "rayon",
  "rten",
  "rten-tensor",
  "serde_json",
