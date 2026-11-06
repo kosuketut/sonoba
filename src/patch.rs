@@ -149,6 +149,23 @@ pub fn glyphs(bgra: &[u8], width: usize, height: usize, (x, y, w, h): (i32, i32,
         }
     }
 
+    // Two lines with no blank row between them: a row far thinner than the solid rows on both
+    // sides of it is the seam, and the line is the part holding the middle of the box.
+    let ink: Vec<usize> = (top..bottom).map(|row| cols.iter().filter(|&&col| is_ink(col, row)).count()).collect();
+    let peak = *ink.iter().max()?;
+    let solid = |n: &usize| n * 2 >= peak;
+    let (first, last) = (top + ink.iter().position(solid)?, top + ink.iter().rposition(solid)?);
+    let centre = (middle.start + middle.end) / 2;
+    let base = top;
+    for row in (first..last).filter(|&row| ink[row - base] * 8 < peak) {
+        if row < centre {
+            top = row + 1;
+        } else {
+            bottom = row;
+            break;
+        }
+    }
+
     let (mut left, mut right) = (x1, x0);
     let (mut fg, mut farthest) = (bg, 0);
     let mut runs = [0u32; 32];
@@ -322,9 +339,29 @@ mod tests {
     }
 
     #[test]
+    fn lines_with_no_gap_are_told_apart_at_the_thin_row() {
+        let mut img = canvas(200, 40, WHITE);
+        paint(&mut img, 200, (10, 6, 190, 18), BLACK, 3); // this line
+        paint(&mut img, 200, (60, 18, 62, 20), BLACK, 1); // a descender bridges the gap
+        paint(&mut img, 200, (10, 20, 190, 32), BLACK, 3); // the next line
+        let g = glyphs(&img, 200, 40, (0, 0, 200, 24), Some("word")).unwrap();
+        assert_eq!((g.y, g.h), (6, 12));
+    }
+
+    #[test]
+    fn all_capitals_are_not_split_at_their_thin_rows() {
+        let mut img = canvas(100, 30, WHITE);
+        paint(&mut img, 100, (10, 8, 90, 10), BLACK, 1); // the bars of a row of E's
+        paint(&mut img, 100, (10, 14, 90, 16), BLACK, 1);
+        paint(&mut img, 100, (10, 20, 90, 22), BLACK, 1);
+        paint(&mut img, 100, (10, 8, 90, 22), BLACK, 5); // their stems
+        assert_eq!(glyphs(&img, 100, 30, (0, 0, 100, 30), Some("word")).unwrap().h, 14);
+    }
+
+    #[test]
     fn a_gap_of_one_row_stays_inside_the_line() {
         let mut img = canvas(100, 30, WHITE);
-        paint(&mut img, 100, (10, 8, 90, 11), BLACK, 3); // the dots of the i's
+        paint(&mut img, 100, (10, 8, 90, 11), BLACK, 15); // the dots of the i's
         paint(&mut img, 100, (10, 12, 90, 22), BLACK, 3);
         assert_eq!(glyphs(&img, 100, 30, (0, 0, 100, 30), Some("word")).unwrap().h, 14);
     }

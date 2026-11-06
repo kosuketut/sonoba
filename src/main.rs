@@ -14,10 +14,11 @@ mod translate;
 use patch::{KEY_COLOR, Patch};
 use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Dwm::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::*;
@@ -26,12 +27,13 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
-const POLL: Duration = Duration::from_millis(150);
+const POLL: Duration = Duration::from_millis(80);
+const PARTIAL_EVERY: Duration = Duration::from_millis(30); // repaints while a page fills in
+const WATCH: Duration = Duration::from_millis(400); // how often a one-shot result is checked
+const STALE_PERCENT: usize = 8; // of the pixels: a scrolled page, not a hover highlight or a caret
 const OCR_IDLE: Duration = Duration::from_secs(60); // free the OCR models this long after the last job
 const MIN_SELECTION: i32 = 8;
 const MIN_TEXT_PX: i32 = 9; // below this Japanese stops being legible; the patch grows instead
-const BATCH_CHARS: usize = 500; // one request at a time, so a long page fills in as it goes
-const MIN_HISTORY_WORDS: usize = 4; // labels make poor context for the paragraph after them
 const STATUS_PX: i32 = 16;
 
 const HK_ONCE: i32 = 1;
@@ -43,6 +45,8 @@ const WM_TRAY: u32 = WM_APP + 2;
 const MENU_EXIT: usize = 1;
 
 const DIM_ALPHA: u8 = 110;
+const HOVER_FRAME: i32 = 4;
+const HOVER_COLOR: u32 = 0x00FFFFFF;
 
 const NOT_FOUND: &str = "翻訳する文字が見つかりません";
 const WORKING: &str = "翻訳中…";
@@ -65,6 +69,7 @@ struct Job {
 static JOB: Mutex<Option<Job>> = Mutex::new(None);
 static WAKE: Condvar = Condvar::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static WARM_UP: AtomicBool = AtomicBool::new(false);
 
 fn set_job(job: Option<Job>) {
     *JOB.lock().unwrap() = job;
@@ -82,16 +87,22 @@ fn worker(overlay: usize) {
     let mut translator = translate::Translator::new();
     loop {
         let mut job = JOB.lock().unwrap();
-        while job.is_none() {
+        while job.is_none() && !WARM_UP.swap(false, Ordering::Relaxed) {
             let (guard, wait) = WAKE.wait_timeout(job, OCR_IDLE).unwrap();
             job = guard;
             if wait.timed_out() {
                 models = None;
             }
         }
-        let current = job.unwrap();
+        let current = *job;
         drop(job);
-        run(current, &mut models, &mut translator, overlay);
+        match current {
+            Some(job) => run(job, &mut models, &mut translator, overlay),
+            None => {
+                models = models.or_else(|| ocr::Ocr::new().ok());
+                translator.warm_up();
+            }
+        }
     }
 }
 
@@ -119,13 +130,35 @@ fn run(job: Job, models: &mut Option<ocr::Ocr>, translator: &mut translate::Tran
             }
         }
         if !job.live {
-            let mut current = JOB.lock().unwrap();
-            if current.is_some_and(|j| j.id == job.id) {
-                *current = None;
+            return watch_for_change(job, &grabber, &last, overlay, &post);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// A one-shot translation fits only the page it was made for, so it goes when the page moves on.
+fn watch_for_change(job: Job, grabber: &capture::Grabber, original: &[u8], overlay: usize, post: &impl Fn(Vec<Patch>)) {
+    let overlay = overlay as HWND;
+    loop {
+        std::thread::sleep(WATCH);
+        if !is_current(job.id) {
+            return;
+        }
+        // Screenshots may show the overlay, so it leaves the capture only for this moment.
+        let frame = unsafe {
+            SetWindowDisplayAffinity(overlay, WDA_EXCLUDEFROMCAPTURE);
+            let frame = grabber.grab(job.region.x, job.region.y);
+            SetWindowDisplayAffinity(overlay, WDA_NONE);
+            frame
+        };
+        let changed = frame.chunks_exact(4).zip(original.chunks_exact(4)).filter(|(a, b)| a != b).count();
+        if changed * 100 > original.len() / 4 * STALE_PERCENT {
+            if is_current(job.id) {
+                set_job(None);
+                post(Vec::new());
             }
             return;
         }
-        std::thread::sleep(POLL);
     }
 }
 
@@ -134,7 +167,7 @@ fn translate_frame(
     job: Job,
     models: &mut Option<ocr::Ocr>,
     translator: &mut translate::Translator,
-    post: &impl Fn(Vec<Patch>),
+    post: &(impl Fn(Vec<Patch>) + Sync),
 ) -> Result<Vec<Patch>, String> {
     if models.is_none() {
         *models = Some(ocr::Ocr::new()?);
@@ -143,32 +176,34 @@ fn translate_frame(
     let lines = models.as_ref().unwrap().read(frame, w, h)?;
     let blocks = ocr::paragraphs(&lines);
     let blocks: Vec<&ocr::Block> = blocks.iter().filter(|b| !ocr::looks_like_code(&b.text)).collect();
-    let (mut out, mut history): (Vec<Patch>, Vec<(String, String)>) = (Vec::new(), Vec::new());
-    let mut start = 0;
-    while start < blocks.len() && is_current(job.id) {
-        let mut end = start + 1;
-        let mut chars = blocks[start].text.len();
-        while end < blocks.len() && chars + blocks[end].text.len() <= BATCH_CHARS {
-            chars += blocks[end].text.len();
-            end += 1;
-        }
-        let texts: Vec<&str> = blocks[start..end].iter().map(|b| b.text.as_str()).collect();
-        let recent = &history[history.len().saturating_sub(translate::HISTORY)..];
-        let translations = translator.translate_all(&texts, recent)?;
-        for (block, text) in blocks[start..end].iter().zip(translations) {
-            // Numbers, code and the like come back unchanged: leave the original on show.
-            if text.to_lowercase() != block.text.to_lowercase() {
-                if block.text.split(' ').count() >= MIN_HISTORY_WORDS {
-                    history.push((block.text.clone(), text.clone()));
-                }
-                out.push(Patch::new(frame, w, h, block, text));
-            }
-        }
-        start = end;
-        if start < blocks.len() {
-            post(out.clone());
+    // Numbers, code and the like come back unchanged: leave the original on show.
+    let patch = |block: &ocr::Block, text: &str| {
+        (text.to_lowercase() != block.text.to_lowercase()).then(|| Patch::new(frame, w, h, block, text.to_string()))
+    };
+    // Whatever is known already goes up with the first new line, so nothing flickers.
+    let mut slots: Vec<Option<Patch>> = vec![None; blocks.len()];
+    let mut pending: Vec<&str> = Vec::new();
+    for (slot, block) in slots.iter_mut().zip(&blocks) {
+        match translator.known(&block.text) {
+            Some(text) => *slot = patch(block, &text),
+            None if !pending.contains(&block.text.as_str()) => pending.push(&block.text),
+            None => {}
         }
     }
+    let shared = Mutex::new((slots, Instant::now()));
+    translator.translate_all(&pending, &|| is_current(job.id), &|source, translation| {
+        let (slots, last_post) = &mut *shared.lock().unwrap();
+        for (slot, block) in slots.iter_mut().zip(&blocks) {
+            if block.text == source {
+                *slot = patch(block, translation);
+            }
+        }
+        if last_post.elapsed() > PARTIAL_EVERY {
+            *last_post = Instant::now();
+            post(slots.iter().flatten().cloned().collect());
+        }
+    })?;
+    let mut out: Vec<Patch> = shared.into_inner().unwrap().0.into_iter().flatten().collect();
     if out.is_empty() && !job.live {
         out.push(Patch::status(NOT_FOUND, job.region.w));
     }
@@ -184,6 +219,7 @@ struct Ui {
     live_next: Cell<bool>, // the selection in progress starts a live job
     drag_from: Cell<Option<(i32, i32)>>,
     drag_to: Cell<(i32, i32)>,
+    hover: Cell<Option<(i32, i32, i32, i32)>>, // the window a click would select, in client pixels
     region: Cell<Region>,
     job_id: Cell<u64>, // results from older jobs are dropped
     live: Cell<bool>,
@@ -198,6 +234,7 @@ thread_local! {
         live_next: Cell::new(false),
         drag_from: Cell::new(None),
         drag_to: Cell::new((0, 0)),
+        hover: Cell::new(None),
         region: Cell::new(Region { x: 0, y: 0, w: 0, h: 0 }),
         job_id: Cell::new(0),
         live: Cell::new(false),
@@ -227,10 +264,17 @@ fn stop() {
 unsafe fn begin_select(live: bool) {
     UI.with(|ui| unsafe {
         if !ui.select.get().is_null() {
+            // The hotkey again, instead of a drag: the same region as last time.
+            let region = ui.region.get();
+            end_select();
+            if region.w > 0 {
+                start_job(region, live);
+            }
             return;
         }
         stop();
-        std::thread::spawn(translate::warm_up); // ready by the time the drag ends
+        WARM_UP.store(true, Ordering::Relaxed); // ready by the time the drag ends
+        WAKE.notify_one();
         ui.live_next.set(live);
         let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
         let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
@@ -252,8 +296,50 @@ unsafe fn begin_select(live: bool) {
         SetWindowDisplayAffinity(select, WDA_EXCLUDEFROMCAPTURE); // the first frame may race its removal
         ui.select.set(select);
         ui.drag_from.set(None);
+        ui.hover.set(None);
         RegisterHotKey(ui.main.get(), HK_ESC, 0, VK_ESCAPE as u32);
         ShowWindow(select, SW_SHOWNOACTIVATE);
+        update_hover(select);
+    });
+}
+
+/// The frontmost window at the point, below the selection layer, cut to its monitor.
+unsafe fn window_at(select: HWND, at: POINT) -> Option<RECT> {
+    unsafe {
+        let mut hwnd = GetWindow(select, GW_HWNDNEXT);
+        while !hwnd.is_null() {
+            let click_through = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT != 0;
+            let (mut cloaked, mut bounds): (u32, RECT) = (0, std::mem::zeroed());
+            DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as *mut _, 4);
+            let size = size_of::<RECT>() as u32;
+            let measured = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS as u32, &mut bounds as *mut _ as *mut _, size) == 0;
+            if IsWindowVisible(hwnd) != 0 && !click_through && cloaked == 0 && measured && PtInRect(&bounds, at) != 0 {
+                let mut info: MONITORINFO = std::mem::zeroed();
+                info.cbSize = size_of::<MONITORINFO>() as u32;
+                GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &mut info);
+                let mut visible: RECT = std::mem::zeroed();
+                IntersectRect(&mut visible, &bounds, &info.rcMonitor);
+                return Some(visible);
+            }
+            hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+        }
+        None
+    }
+}
+
+/// A click with no drag selects the window under it, so that window gets a frame.
+unsafe fn update_hover(select: HWND) {
+    UI.with(|ui| unsafe {
+        let (mut at, mut origin) = (POINT { x: 0, y: 0 }, POINT { x: 0, y: 0 });
+        GetCursorPos(&mut at);
+        ClientToScreen(select, &mut origin);
+        let new = window_at(select, at).map(|r| (r.left - origin.x, r.top - origin.y, r.right - origin.x, r.bottom - origin.y));
+        let old = ui.hover.replace(new);
+        if old != new {
+            for (left, top, right, bottom) in [old, new].into_iter().flatten() {
+                InvalidateRect(select, &RECT { left, top, right, bottom }, 0);
+            }
+        }
     });
 }
 
@@ -275,12 +361,15 @@ fn selection_rect(from: (i32, i32), to: (i32, i32)) -> RECT {
 unsafe fn finish_select(hwnd: HWND) {
     UI.with(|ui| unsafe {
         let Some(from) = ui.drag_from.take() else { return };
-        let rect = selection_rect(from, ui.drag_to.get());
+        let mut rect = selection_rect(from, ui.drag_to.get());
         let mut origin = POINT { x: 0, y: 0 };
         ClientToScreen(hwnd, &mut origin);
+        let hover = ui.hover.get();
+        let live = ui.live_next.get();
         end_select();
-        if rect.right - rect.left < MIN_SELECTION || rect.bottom - rect.top < MIN_SELECTION {
-            return;
+        if is_small(&rect) {
+            let Some((left, top, right, bottom)) = hover else { return };
+            rect = RECT { left, top, right, bottom };
         }
         let region = Region {
             x: rect.left + origin.x,
@@ -288,7 +377,16 @@ unsafe fn finish_select(hwnd: HWND) {
             w: rect.right - rect.left,
             h: rect.bottom - rect.top,
         };
-        let live = ui.live_next.get();
+        start_job(region, live);
+    });
+}
+
+fn is_small(rect: &RECT) -> bool {
+    rect.right - rect.left < MIN_SELECTION || rect.bottom - rect.top < MIN_SELECTION
+}
+
+fn start_job(region: Region, live: bool) {
+    UI.with(|ui| unsafe {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         ui.region.set(region);
         ui.job_id.set(id);
@@ -308,11 +406,19 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let mut ps: PAINTSTRUCT = std::mem::zeroed();
                 let hdc = BeginPaint(hwnd, &mut ps);
                 FillRect(hdc, &ps.rcPaint, GetStockObject(BLACK_BRUSH));
-                let (from, to) = UI.with(|ui| (ui.drag_from.get(), ui.drag_to.get()));
-                if let Some(from) = from {
-                    let brush = CreateSolidBrush(KEY_COLOR);
-                    FillRect(hdc, &selection_rect(from, to), brush);
-                    DeleteObject(brush);
+                let (from, to, hover) = UI.with(|ui| (ui.drag_from.get(), ui.drag_to.get(), ui.hover.get()));
+                let dragged = from.map(|from| selection_rect(from, to)).filter(|rect| !is_small(rect));
+                match (dragged, hover) {
+                    (Some(rect), _) => fill(hdc, &rect, KEY_COLOR),
+                    // A frame, not a clear area: clicks fall straight through the key colour.
+                    (None, Some((left, top, right, bottom))) => {
+                        let t = HOVER_FRAME;
+                        fill(hdc, &RECT { left, top, right, bottom: top + t }, HOVER_COLOR);
+                        fill(hdc, &RECT { left, top: bottom - t, right, bottom }, HOVER_COLOR);
+                        fill(hdc, &RECT { left, top, right: left + t, bottom }, HOVER_COLOR);
+                        fill(hdc, &RECT { left: right - t, top, right, bottom }, HOVER_COLOR);
+                    }
+                    (None, None) => {}
                 }
                 EndPaint(hwnd, &ps);
                 0
@@ -328,13 +434,19 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             WM_MOUSEMOVE => {
                 let at = lparam_xy(l);
-                UI.with(|ui| {
-                    if let Some(from) = ui.drag_from.get() {
+                let dragging = UI.with(|ui| {
+                    ui.drag_from.get().inspect(|&from| {
                         let old = selection_rect(from, ui.drag_to.replace(at));
+                        if let Some((left, top, right, bottom)) = ui.hover.get().filter(|_| !is_small(&selection_rect(from, at))) {
+                            InvalidateRect(hwnd, &RECT { left, top, right, bottom }, 0);
+                        }
                         InvalidateRect(hwnd, &old, 0);
                         InvalidateRect(hwnd, &selection_rect(from, at), 0);
-                    }
+                    })
                 });
+                if dragging.is_none() {
+                    update_hover(hwnd);
+                }
                 0
             }
             WM_LBUTTONUP => {
@@ -539,7 +651,7 @@ unsafe fn tray_icon(hwnd: HWND, action: u32) {
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
         data.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
-        let tip = wide("画面翻訳\nCtrl+Alt+T 1回 / Ctrl+Alt+R リアルタイム / Ctrl+Alt+X 閉じる");
+        let tip = wide("画面翻訳\nCtrl+Alt+T 1回 / R リアルタイム / X 消す\n2度押しで同じ範囲、クリックで窓全体");
         data.szTip[..tip.len()].copy_from_slice(&tip);
         Shell_NotifyIconW(action, &data);
     }

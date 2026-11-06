@@ -107,7 +107,6 @@ impl Ocr {
             rten::thread_pool().run(|| boxes.par_iter().map(|&rect| self.read_line(bgra, &img, (w, h), rect)).collect::<Result<_, _>>())?;
         let mut lines: Vec<Line> = lines.into_iter().flatten().collect();
         reading_order(&mut lines);
-        separate_touching_lines(&mut lines);
         Ok(lines)
     }
 
@@ -250,18 +249,6 @@ fn same_row(a: &Glyphs, b: &Glyphs) -> bool {
     overlap * 2 > a.h.min(b.h)
 }
 
-/// With no blank row between two lines their ink counts as one band, and the upper line gets
-/// the height of both. The lower line's top is where it really ends.
-fn separate_touching_lines(lines: &mut [Line]) {
-    for i in 1..lines.len() {
-        let (a, b) = (lines[i - 1].glyphs, lines[i].glyphs);
-        let same_column = (a.x + a.w).min(b.x + b.w) > a.x.max(b.x);
-        if same_column && b.y > a.y && b.y < a.y + a.h {
-            lines[i - 1].glyphs.h = b.y - a.y;
-        }
-    }
-}
-
 /// The font size that gives a line this much ink, going by which parts of the letters the
 /// text uses: "same" fills only the x-height, "Sign" also reaches up and down.
 fn font_size(ink_h: i32, text: &str) -> f32 {
@@ -390,13 +377,6 @@ mod tests {
         let mut code = l(0, 24, 300, "python");
         code.glyphs.bg = [35, 31, 27];
         assert_eq!(paragraphs(&[l(0, 0, 500, "pay more for the output."), code]).len(), 2);
-    }
-
-    #[test]
-    fn touching_lines_get_their_own_heights() {
-        let mut lines = [at(10, 100, 70, 22, "Unlimited"), at(20, 111, 80, 12, "Active subscription")];
-        separate_touching_lines(&mut lines);
-        assert_eq!(lines[0].glyphs.h, 11);
     }
 
     #[test]
