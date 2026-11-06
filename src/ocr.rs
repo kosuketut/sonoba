@@ -96,7 +96,7 @@ impl Ocr {
     pub fn new() -> Result<Self, String> {
         let load = |b| Model::load_static_slice(b).map_err(|e| e.to_string());
         let mut chars = vec![""]; // class 0 is the CTC blank
-        chars.extend(DICT.split('\n').filter(|s| !s.is_empty()));
+        chars.extend(DICT.lines().filter(|s| !s.is_empty())); // git may check dict.txt out as CRLF
         chars.push(" ");
         Ok(Self { det: load(DET)?, rec: load(REC)?, chars })
     }
