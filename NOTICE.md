@@ -36,3 +36,7 @@ Release packages contain `vcruntime140.dll`, `vcruntime140_1.dll` and `msvcp140.
 ## Rust crates
 
 The app links rten (`licenses/rten.txt`), ureq, serde_json, rayon, windows-sys and webview2-com, among others, under the MIT and Apache-2.0 licenses. `licenses/rust-crates.txt` lists them all with their texts, and `scripts/licenses.ps1` writes that file.
+
+## Demo video
+
+`docs/demo.webp` in this repository contains clips from Tears of Steel, (c) copyright Blender Foundation | <https://mango.blender.org>, under the [Creative Commons Attribution 3.0 license](https://creativecommons.org/licenses/by/3.0/). The clips were cut, used as a background, and shown with translated subtitles. The translations are output of PLaMo 3 Translate.

@@ -2,6 +2,10 @@
 
 **日本語** | [English](README.en.md)
 
+![画面の文字が訳文に置き換わるデモ](docs/demo.webp)
+
+<sub>映像は等速で、訳文は PC の中で動かした PLaMo 3 Translate 2B の生成物です。リアルタイムの訳文は普段は録画に写らないので、写るように変えた録画用のビルドで撮りました。ゲームの画面はデモ用に作ったものです。映画の場面とゲームの背景は Tears of Steel (CC BY 3.0 Blender Foundation | mango.blender.org) です。</sub>
+
 Windows 用の常駐アプリです。画面の好きな範囲を OCR して、文字を訳文に置き換えて見せます。翻訳先は日本語、やさしい日本語、英語、韓国語、中国語から選べます。Google 翻訳の画像翻訳のように、訳文を元の文字の位置に重ねて表示します。処理はすべて PC の中で完結します。
 
 Built with PLaMo.
