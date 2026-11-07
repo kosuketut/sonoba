@@ -15,7 +15,7 @@ The model is not included in this repository or in release packages. The app dow
 - PaddleOCR: <https://github.com/PaddlePaddle/PaddleOCR>
 - RapidOCR: <https://github.com/RapidAI/RapidOCR>
 
-`models/korean_PP-OCRv5_mobile_rec.onnx` is PaddlePaddle's official ONNX export, and `models/dict_korean.txt` its character list, also under the Apache License 2.0.
+The app downloads PaddlePaddle's official ONNX export of the Korean recognition model when the user asks, also under the Apache License 2.0. `models/dict_korean.txt` is its character list; `models/korean_PP-OCRv5_mobile_rec.onnx` is a copy for the tests and is not in release packages.
 
 - <https://huggingface.co/PaddlePaddle/korean_PP-OCRv5_mobile_rec_onnx>
 

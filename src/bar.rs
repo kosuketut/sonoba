@@ -16,6 +16,7 @@ const SOURCES: [(&str, &str); 2] = [("auto", "自動"), ("ja", "日本語も翻�
 const TARGETS: [(&str, &str); 6] =
     [("ja", "日本語"), ("ja(easy)", "やさしい日本語"), ("en", "英語"), ("ko", "韓国語"), ("zh-hans", "中国語（簡体字）"), ("zh-hant", "中国語（繁体字）")];
 const CHIPS: usize = 3;
+const ADD_HINT: &str = "Shift+ドラッグで範囲を追加";
 const LIVE: usize = 2; // the one chip that is a switch, not a list
 const BAR_H: i32 = 48;
 const PAD: i32 = 8;
@@ -29,6 +30,7 @@ const BG: u32 = 0x00221E1C;
 const CHIP: u32 = 0x00332E2C;
 const HOVER: u32 = 0x0044403C;
 const TEXT: u32 = 0x00F2F3F0;
+const SOFT: u32 = 0x00ACB1A8;
 const ACCENT: u32 = 0x007AC337;
 
 thread_local! {
@@ -37,6 +39,7 @@ thread_local! {
     static OPEN: Cell<Option<usize>> = const { Cell::new(None) }; // the chip showing its list
     static HOT: Cell<Option<(usize, Option<usize>)>> = const { Cell::new(None) }; // chip, and row of its list
     static LIVE_ON: Cell<bool> = const { Cell::new(false) };
+    static RUNNING: Cell<bool> = const { Cell::new(false) }; // there is a job to add a region to
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -108,6 +111,9 @@ fn chips(hdc: HDC) -> ([RECT; CHIPS], i32) {
         *rect = RECT { left: x, top, right, bottom: top + scaled(CHIP_H) };
         x = right + scaled(PAD);
     }
+    if RUNNING.get() {
+        x += text_width(hdc, &t(ADD_HINT)) + scaled(CHIP_PAD);
+    }
     (out, x)
 }
 
@@ -141,7 +147,7 @@ fn lay_out() {
     }
 }
 
-pub fn show(live: bool) {
+pub fn show(live: bool, running: bool) {
     unsafe {
         let mut at = POINT { x: 0, y: 0 };
         GetCursorPos(&mut at);
@@ -156,6 +162,7 @@ pub fn show(live: bool) {
         OPEN.set(None);
         HOT.set(None);
         LIVE_ON.set(live);
+        RUNNING.set(running);
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("ScreenTranslateBar"),
@@ -243,6 +250,11 @@ unsafe fn paint(hwnd: HWND) {
                 let color = if on { ACCENT } else if hot == Some((i, None)) || OPEN.get() == Some(i) { HOVER } else { CHIP };
                 fill(hdc, rect, color, corner);
                 label(hdc, &text, rect, if on { BG } else { TEXT });
+            }
+            if RUNNING.get() {
+                let last = rects[CHIPS - 1];
+                let hint = RECT { left: last.right, right: w, top: 0, bottom: scaled(BAR_H) };
+                label(hdc, &t(ADD_HINT), &hint, SOFT);
             }
             if let Some(chip) = OPEN.get() {
                 let config = config::get();

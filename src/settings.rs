@@ -6,7 +6,8 @@ use crate::engine::{self, Device};
 use crate::i18n::t;
 use crate::{models, request_load, request_unload, try_hotkeys};
 use serde_json::{Value, json};
-use std::cell::{Cell, RefCell};
+use crate::translate::HISTORY;
+use std::cell::{Cell, RefCell, OnceCell};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::Ordering;
@@ -36,7 +37,6 @@ const RUN_KEY: *const u16 = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Ru
 const RUN_VALUE: *const u16 = w!("screen-translate");
 const THEME_KEY: *const u16 = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
 const USE_DARK_TITLE_BAR: u32 = 20; // DWMWA_USE_IMMERSIVE_DARK_MODE
-const RUNTIME_PAGE: *const u16 = w!("https://developer.microsoft.com/microsoft-edge/webview2/");
 
 thread_local! {
     static WINDOW: Cell<HWND> = const { Cell::new(null_mut()) };
@@ -44,6 +44,7 @@ thread_local! {
     static WEBVIEW: RefCell<Option<ICoreWebView2>> = const { RefCell::new(None) };
     static SENT: RefCell<String> = const { RefCell::new(String::new()) };
     static MESSAGE: RefCell<String> = const { RefCell::new(String::new()) };
+    static FONTS: OnceCell<Vec<String>> = const { OnceCell::new() };
 }
 
 pub fn window() -> HWND {
@@ -74,6 +75,35 @@ fn light_theme() -> bool {
     let (mut value, mut size) = (1u32, 4u32);
     unsafe { RegGetValueW(HKEY_CURRENT_USER, THEME_KEY, w!("AppsUseLightTheme"), RRF_RT_REG_DWORD, null_mut(), &mut value as *mut _ as *mut _, &mut size) };
     value != 0
+}
+
+unsafe extern "system" fn add_font(font: *const LOGFONTW, _: *const TEXTMETRICW, _: u32, list: LPARAM) -> i32 {
+    unsafe {
+        let name = &(*font).lfFaceName;
+        let name = String::from_utf16_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())]);
+        if !name.starts_with('@') {
+            (*(list as *mut Vec<String>)).push(name); // the @ ones are for vertical text
+        }
+        1
+    }
+}
+
+fn fonts() -> Vec<String> {
+    FONTS.with(|fonts| {
+        fonts
+            .get_or_init(|| unsafe {
+                let mut list: Vec<String> = Vec::new();
+                let mut wanted: LOGFONTW = std::mem::zeroed();
+                wanted.lfCharSet = DEFAULT_CHARSET as u8;
+                let hdc = GetDC(null_mut());
+                EnumFontFamiliesExW(hdc, &wanted, Some(add_font), &mut list as *mut _ as LPARAM, 0);
+                ReleaseDC(null_mut(), hdc);
+                list.sort();
+                list.dedup();
+                list
+            })
+            .clone()
+    })
 }
 
 fn data_dir() -> PathBuf {
@@ -129,6 +159,14 @@ fn state() -> Value {
         "source": config.source,
         "target": config.target,
         "ui_lang": config.ui_lang,
+        "taken": *crate::TAKEN_KEYS.lock().unwrap(),
+        "form": config.form,
+        "glossary": config.glossary,
+        "font": config.font,
+        "fonts": fonts(),
+        "bold_text": config.bold_text,
+        "opacity": config.opacity,
+        "keep_history": config.keep_history,
         "autostart": autostart(),
         "intro": !config.intro_done && !models::is_present(&config.model),
     })
@@ -217,6 +255,42 @@ fn on_message(text: &str) {
         }
         "flash_frame" => config::update(|c| c.flash_frame = flag),
         "autostart" => set_autostart(flag),
+        "form" => config::update(|c| c.form = text_value),
+        "glossary" => {
+            let pair = |t: &Value| Some((t[0].as_str()?.trim().to_string(), t[1].as_str()?.trim().to_string()));
+            let terms = value.as_array().map_or_else(Vec::new, |terms| terms.iter().filter_map(pair).collect());
+            config::update(|c| c.glossary = terms);
+        }
+        "font" => {
+            config::update(|c| c.font = text_value);
+            crate::look_changed();
+        }
+        "bold_text" => {
+            config::update(|c| c.bold_text = flag);
+            crate::look_changed();
+        }
+        "opacity" => {
+            config::update(|c| c.opacity = value.as_u64().unwrap_or(100).clamp(30, 100) as u8);
+            crate::look_changed();
+        }
+        "keep_history" => {
+            config::update(|c| c.keep_history = flag);
+            if !flag {
+                HISTORY.lock().unwrap().clear();
+            }
+        }
+        "history_clear" => HISTORY.lock().unwrap().clear(),
+        "copy" => {
+            crate::copy_to_clipboard(&text_value);
+        }
+        "history" => {
+            let history: Vec<(String, String)> = HISTORY.lock().unwrap().iter().cloned().collect();
+            WEBVIEW.with_borrow(|webview| {
+                if let Some(webview) = webview {
+                    let _ = unsafe { webview.PostWebMessageAsJson(&HSTRING::from(json!({ "history": history }).to_string())) };
+                }
+            });
+        }
         "intro_done" => config::update(|c| c.intro_done = true),
         // The licence binds whoever downloads the model; the page asks them first.
         "download" => models::start_download(config::get().model),
@@ -372,26 +446,11 @@ pub fn register_class() {
     }
 }
 
-/// True if the page can open. Otherwise Windows lacks WebView2, and Microsoft has it.
-fn runtime_present() -> bool {
-    let mut version = PWSTR::null();
-    let found = unsafe { GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut version) }.is_ok() && !version.is_null();
-    drop(CoTaskMemPWSTR::from(version));
-    found
-}
-
 pub fn open() {
     unsafe {
         if !window().is_null() {
             ShowWindow(window(), SW_RESTORE);
             SetForegroundWindow(window());
-            return;
-        }
-        if !runtime_present() {
-            let question = wide(&t("設定画面には WebView2 ランタイムが必要です。Microsoft のページを開きますか？"));
-            if MessageBoxW(null_mut(), question.as_ptr(), w!("screen-translate"), MB_YESNO | MB_ICONINFORMATION) == IDYES {
-                ShellExecuteW(null_mut(), w!("open"), RUNTIME_PAGE, null(), null(), SW_SHOWNORMAL);
-            }
             return;
         }
         let title = wide(&t("screen-translate の設定"));
@@ -419,6 +478,7 @@ pub fn open() {
         SetTimer(hwnd, TIMER, TIMER_MS, None);
         if start_page(hwnd).is_err() {
             DestroyWindow(hwnd);
+            MessageBoxW(null_mut(), wide(&t("設定画面を開けません。WebView2 ランタイムが必要です。")).as_ptr(), w!("screen-translate"), MB_OK | MB_ICONWARNING);
         }
     }
 }

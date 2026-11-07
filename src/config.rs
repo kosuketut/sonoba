@@ -9,12 +9,22 @@ use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
 
 const MOD_ALT: u32 = 1;
 const MOD_CONTROL: u32 = 2;
+const MOUSE_MIDDLE: u32 = 4; // virtual key codes, which Hotkey::key holds for mouse buttons too
+const MOUSE_FORWARD: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hotkey {
     pub mods: u32, // MOD_ALT and so on, as RegisterHotKey takes them
     pub key: u32,  // a virtual key code
 }
+
+impl Hotkey {
+    pub fn is_mouse(&self) -> bool {
+        (MOUSE_MIDDLE..=MOUSE_FORWARD).contains(&self.key)
+    }
+}
+
+pub const ACTIONS: usize = 5; // one shot, live, clear, show the original, copy
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -28,7 +38,13 @@ pub struct Config {
     pub target: String, // a language code of the model, "ja(easy)" included
     pub ui_lang: String, // "ja" or "en"
     pub intro_done: bool, // the first-run guide was seen through
-    pub hotkeys: [Hotkey; 3], // one shot, live, clear
+    pub form: String, // "" follows the original's tone; "polite" or "plain" for Japanese
+    pub glossary: Vec<(String, String)>, // term, and the translation it must get
+    pub font: String, // "" for the app's default
+    pub bold_text: bool, // always, not only where the original is bold
+    pub opacity: u8, // percent, of everything drawn over the screen
+    pub keep_history: bool, // in memory only: nothing read off the screen goes to disk
+    pub hotkeys: [Hotkey; ACTIONS],
 }
 
 /// Japanese on a Japanese Windows, English on any other.
@@ -52,7 +68,13 @@ impl Default for Config {
             target: "ja".to_string(),
             ui_lang: system_language().to_string(),
             intro_done: false,
-            hotkeys: [ctrl_alt('T'), ctrl_alt('R'), ctrl_alt('X')],
+            form: String::new(),
+            glossary: Vec::new(),
+            font: String::new(),
+            bold_text: false,
+            opacity: 100,
+            keep_history: true,
+            hotkeys: [ctrl_alt('T'), ctrl_alt('R'), ctrl_alt('X'), ctrl_alt('Q'), ctrl_alt('C')],
         }
     }
 }
@@ -61,7 +83,7 @@ impl Config {
     /// Whatever is missing or malformed falls back to its default.
     fn parse(text: &str) -> Self {
         let mut config = Self::default();
-        let Ok(saved) = serde_json::from_str::<Value>(text) else { return config };
+        let Ok(saved) = serde_json::from_str::<Value>(text.trim_start_matches('\u{FEFF}')) else { return config };
         if let Some(model) = saved["model"].as_str() {
             config.model = model.to_string();
         }
@@ -84,7 +106,18 @@ impl Config {
             config.ui_lang = language.to_string();
         }
         config.intro_done = saved["intro_done"].as_bool().unwrap_or(false);
-        for (slot, name) in config.hotkeys.iter_mut().zip(["once", "live", "clear"]) {
+        if let Some(form) = saved["form"].as_str().filter(|f| ["polite", "plain"].contains(f)) {
+            config.form = form.to_string();
+        }
+        if let Some(terms) = saved["glossary"].as_array() {
+            let pair = |t: &Value| Some((t[0].as_str()?.to_string(), t[1].as_str()?.to_string()));
+            config.glossary = terms.iter().filter_map(pair).collect();
+        }
+        config.font = saved["font"].as_str().unwrap_or("").to_string();
+        config.bold_text = saved["bold_text"].as_bool().unwrap_or(false);
+        config.opacity = saved["opacity"].as_u64().map_or(100, |o| o.clamp(30, 100) as u8);
+        config.keep_history = saved["keep_history"].as_bool().unwrap_or(true);
+        for (slot, name) in config.hotkeys.iter_mut().zip(["once", "live", "clear", "peek", "copy"]) {
             if let (Some(mods), Some(key)) = (saved[name]["mods"].as_u64(), saved[name]["key"].as_u64()) {
                 *slot = Hotkey { mods: mods as u32, key: key as u32 };
             }
@@ -113,6 +146,14 @@ impl Config {
             "once": hotkey(&self.hotkeys[0]),
             "live": hotkey(&self.hotkeys[1]),
             "clear": hotkey(&self.hotkeys[2]),
+            "peek": hotkey(&self.hotkeys[3]),
+            "copy": hotkey(&self.hotkeys[4]),
+            "form": self.form,
+            "glossary": self.glossary,
+            "font": self.font,
+            "bold_text": self.bold_text,
+            "opacity": self.opacity,
+            "keep_history": self.keep_history,
         });
         serde_json::to_string_pretty(&saved).unwrap_or_default()
     }
@@ -180,7 +221,19 @@ mod tests {
         config.ui_lang = "en".into();
         config.intro_done = true;
         config.hotkeys[1] = Hotkey { mods: 6, key: 0x70 };
+        config.hotkeys[4] = Hotkey { mods: 0, key: 5 };
+        config.form = "polite".into();
+        config.glossary = vec![("bank".into(), "川岸".into())];
+        config.font = "Meiryo".into();
+        config.bold_text = true;
+        config.opacity = 80;
+        config.keep_history = false;
         assert_eq!(Config::parse(&config.to_json()), config);
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_no_damage() {
+        assert!(Config::parse("\u{FEFF}{\"show_frame\": true}").show_frame);
     }
 
     #[test]

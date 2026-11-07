@@ -52,9 +52,10 @@ select, .key {
 select { cursor: pointer; }
 .key { cursor: pointer; text-align: center; font-variant-numeric: tabular-nums; }
 .key.wait { border-color: var(--accent); color: var(--accent); }
+.key.taken { border-color: var(--danger); color: var(--danger); }
 select:focus-visible, .key:focus-visible, .btn:focus-visible, .choice:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .btn {
-  font: inherit; border: 1px solid var(--line); background: var(--field); color: var(--text); border-radius: 7px;
+  white-space: nowrap; font: inherit; border: 1px solid var(--line); background: var(--field); color: var(--text); border-radius: 7px;
   padding: 6px 14px; cursor: pointer;
 }
 .btn:hover:not(:disabled) { border-color: var(--accent); }
@@ -102,6 +103,19 @@ dialog .actions { padding: 8px 0 0; justify-content: flex-end; }
 .steps { color: var(--soft); font-size: 12.5px; margin-bottom: 18px; }
 .foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 14px; }
 .keys { display: grid; grid-template-columns: auto 1fr; gap: 8px 14px; margin-bottom: 14px; }
+.terms { padding: 4px 16px 12px; }
+.term { display: grid; grid-template-columns: 1fr auto 1fr auto; gap: 8px; align-items: center; margin-bottom: 6px; }
+input[type=text], input[type=search] {
+  font: inherit; color: var(--text); background: var(--field); border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; width: 100%; min-width: 0;
+}
+input[type=text]:focus-visible, input[type=search]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.x { all: unset; cursor: pointer; color: var(--soft); padding: 2px 8px; border-radius: 6px; }
+.x:hover { color: var(--danger); }
+.past { padding: 10px 16px; cursor: pointer; user-select: text; }
+.past + .past { border-top: 1px solid var(--line); }
+.past:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.past small { color: var(--soft); display: block; }
+.toolbar { display: flex; gap: 8px; margin-bottom: 12px; }
 kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); white-space: nowrap; }
 </style>
 </head>
@@ -112,6 +126,7 @@ kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(
   <button data-go="model" data-t="nav_model"></button>
   <button data-go="keys" data-t="nav_keys"></button>
   <button data-go="look" data-t="nav_look"></button>
+  <button data-go="history" data-t="nav_history"></button>
   <button data-go="run" data-t="nav_run"></button>
   <button data-go="about" data-t="nav_about"></button>
 </nav>
@@ -123,12 +138,17 @@ kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(
     <div class="card">
       <div class="row"><div><b data-t="source"></b><small data-t="source_note"></small></div><select id="source"></select></div>
       <div class="row"><div><b data-t="target"></b></div><select id="target"></select></div>
+      <div class="row" id="form_row"><div><b data-t="form"></b><small data-t="form_note"></small></div><select id="form"></select></div>
     </div>
     <p class="hint" data-t="easy_note"></p>
     <div class="card">
       <div class="row"><div><b data-t="korean"></b><small id="korean_status"></small></div>
         <span><button class="btn" id="korean_delete" data-t="delete"></button> <button class="btn main" id="korean_download"></button></span></div>
       <div class="bar" id="korean_bar"><i></i></div>
+    </div>
+    <div class="card">
+      <div class="row"><div><b data-t="glossary"></b><small data-t="glossary_note"></small></div><button class="btn" id="term_add" data-t="term_add"></button></div>
+      <div class="terms" id="terms"></div>
     </div>
   </section>
 
@@ -154,6 +174,8 @@ kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(
       <div class="row"><div><b data-t="key_once"></b></div><button class="key" data-key="0"></button></div>
       <div class="row"><div><b data-t="key_live"></b></div><button class="key" data-key="1"></button></div>
       <div class="row"><div><b data-t="key_clear"></b></div><button class="key" data-key="2"></button></div>
+      <div class="row"><div><b data-t="key_peek"></b><small data-t="key_peek_note"></small></div><button class="key" data-key="3"></button></div>
+      <div class="row"><div><b data-t="key_copy"></b></div><button class="key" data-key="4"></button></div>
     </div>
     <p class="hint" data-t="key_note"></p>
   </section>
@@ -164,6 +186,21 @@ kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(
       <div class="row"><div><b data-t="show_frame"></b><small data-t="show_frame_note"></small></div><label class="switch"><input type="checkbox" id="show_frame"><i></i></label></div>
       <div class="row"><div><b data-t="flash_frame"></b></div><label class="switch"><input type="checkbox" id="flash_frame"><i></i></label></div>
     </div>
+    <div class="card">
+      <div class="row"><div><b data-t="font"></b></div><select id="font"></select></div>
+      <div class="row"><div><b data-t="bold_text"></b><small data-t="bold_note"></small></div><label class="switch"><input type="checkbox" id="bold_text"><i></i></label></div>
+      <div class="row"><div><b data-t="opacity"></b><small data-t="opacity_note"></small></div><select id="opacity"></select></div>
+    </div>
+  </section>
+
+  <section id="history">
+    <h1 data-t="nav_history"></h1>
+    <div class="card">
+      <div class="row"><div><b data-t="keep_history"></b><small data-t="keep_note"></small></div><label class="switch"><input type="checkbox" id="keep_history"><i></i></label></div>
+    </div>
+    <div class="toolbar"><input type="search" id="history_find"><button class="btn" id="history_clear" data-t="clear"></button></div>
+    <div class="card" id="history_list"></div>
+    <p class="hint" data-t="history_note"></p>
   </section>
 
   <section id="run">
@@ -184,6 +221,7 @@ kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(
     <div class="card">
       <div class="row"><div><b>screen-translate</b><small id="version"></small></div></div>
       <div class="row"><div><b>Built with PLaMo</b><small data-t="license_note"></small></div><a id="license" data-t="license_link"></a></div>
+      <div class="row"><div><b data-t="work_use"></b><small data-t="work_note"></small></div><a id="work_license" data-t="license_link"></a></div>
       <div class="row"><div><b data-t="folder"></b><small id="folder" style="user-select:text;word-break:break-all"></small></div></div>
     </div>
   </section>
@@ -242,7 +280,14 @@ const TEXT = {
     st_none: 'ダウンロードされていません', st_ready: '読み込み済み（すぐ翻訳できます）', st_loading: '読み込み中…', st_idle: '読み込まれていません（最初の翻訳のときに読み込みます）',
     model_note: 'GGUF ファイルをモデルのフォルダに置くと一覧に出ます。',
     key_once: '範囲を 1 回翻訳', key_live: 'リアルタイム翻訳', key_clear: '訳文を消す', key_wait: 'キーを押してください…',
-    key_note: 'Ctrl か Alt を含む組み合わせを押します。Esc で取り消せます。', key_bad: 'Ctrl か Alt を含めてください',
+    key_note: 'Ctrl か Alt を含むキー、またはマウスの中ボタンとサイドボタンを押します。Esc で取り消せます。', key_bad: 'Ctrl か Alt を含めてください',
+    key_taken: '別のアプリが使っています。別のキーにしてください', key_peek: '押している間だけ原文を見る', key_peek_note: '離すと訳文に戻ります', key_copy: '訳文をコピー',
+    mouse_mid: 'マウス中ボタン', mouse_back: 'マウス戻るボタン', mouse_next: 'マウス進むボタン',
+    form: '文体', form_note: '翻訳先が日本語のときに使います', form_auto: 'おまかせ（原文に合わせる）', form_polite: 'です・ます調', form_plain: 'だ・である調',
+    glossary: '用語集', glossary_note: '決まった訳にしたい言葉を登録します。原文にその言葉があるときだけ使います', term_add: '追加', term_from: '原文の言葉', term_to: '訳語',
+    font: '訳文のフォント', font_default: '標準（Yu Gothic UI）', bold_text: '訳文を太字にする', bold_note: 'オフのときは元の文字に合わせます', opacity: '訳文の濃さ', opacity_note: '下げると元の画面が透けて見えます',
+    nav_history: '履歴', keep_history: '履歴を残す', keep_note: 'アプリを終了すると消えます。ファイルには保存しません', clear: 'すべて消す', find: '履歴を検索', history_empty: 'まだ履歴はありません', history_note: 'クリックすると訳文をコピーします。', copied: 'コピーしました',
+    work_use: '会社で使うとき', work_note: '業務での利用は商業目的にあたり、PFN への登録などが必要です。ライセンスを確認してください',
     show_frame: '翻訳している範囲に緑の枠線を表示する', show_frame_note: '選んだ範囲か窓の外側に細い線を出します', flash_frame: '翻訳が終わったら枠線を一瞬表示する',
     device: '実行方法', dev_auto: '自動（GPU に載る分を GPU で）', dev_gpu: 'GPU のみ', dev_cpu: 'CPU のみ', gpu_limit: 'GPU メモリ上限', no_limit: '制限なし', threads: 'CPU スレッド数', auto: '自動',
     autostart: 'Windows の起動時に開始する', autostart_note: 'アプリのフォルダを移動したら入れ直してください', ui_lang: '表示の言語',
@@ -267,7 +312,14 @@ const TEXT = {
     st_none: 'Not downloaded', st_ready: 'Loaded and ready', st_loading: 'Loading…', st_idle: 'Not loaded (loads with the first translation)',
     model_note: 'GGUF files placed in the model folder appear in this list.',
     key_once: 'Translate a region once', key_live: 'Live translation', key_clear: 'Clear the translation', key_wait: 'Press the keys…',
-    key_note: 'Press a combination with Ctrl or Alt. Esc cancels.', key_bad: 'Include Ctrl or Alt',
+    key_note: 'Press a combination with Ctrl or Alt, or the middle or a side mouse button. Esc cancels.', key_bad: 'Include Ctrl or Alt',
+    key_taken: 'Another app holds this key. Choose another', key_peek: 'Show the original while held', key_peek_note: 'The translation returns on release', key_copy: 'Copy the translation',
+    mouse_mid: 'Middle mouse button', mouse_back: 'Mouse back button', mouse_next: 'Mouse forward button',
+    form: 'Style', form_note: 'For Japanese output', form_auto: 'Automatic (follows the original)', form_polite: 'Polite (desu/masu)', form_plain: 'Plain (da/dearu)',
+    glossary: 'Glossary', glossary_note: 'Words that must get a fixed translation. Used only when the original contains them', term_add: 'Add', term_from: 'Word in the original', term_to: 'Translation',
+    font: 'Translation font', font_default: 'Default (Yu Gothic UI)', bold_text: 'Always bold', bold_note: 'Off follows the original text', opacity: 'Strength', opacity_note: 'Lower lets the screen show through',
+    nav_history: 'History', keep_history: 'Keep a history', keep_note: 'Gone when the app exits. Nothing is saved to a file', clear: 'Clear all', find: 'Search the history', history_empty: 'Nothing here yet', history_note: 'Click an entry to copy its translation.', copied: 'Copied',
+    work_use: 'Using it at work', work_note: 'Business use counts as commercial and needs registering with PFN, or a contract. Check the license',
     show_frame: 'Show a green frame around the region', show_frame_note: 'A thin line just outside the region or window', flash_frame: 'Flash the frame when a translation finishes',
     device: 'Run on', dev_auto: 'Automatic (GPU for what fits)', dev_gpu: 'GPU only', dev_cpu: 'CPU only', gpu_limit: 'GPU memory limit', no_limit: 'No limit', threads: 'CPU threads', auto: 'Automatic',
     autostart: 'Start with Windows', autostart_note: 'Turn this on again after moving the app folder', ui_lang: 'Language',
@@ -303,6 +355,9 @@ function show(id) {
   for (const b of document.querySelectorAll('nav button')) b.setAttribute('aria-current', b.dataset.go === id);
 }
 function keyName(v) {
+  if (v === 4) return T('mouse_mid');
+  if (v === 5) return T('mouse_back');
+  if (v === 6) return T('mouse_next');
   if (v >= 0x41 && v <= 0x5A || v >= 0x30 && v <= 0x39) return String.fromCharCode(v);
   if (v >= 0x70 && v <= 0x87) return 'F' + (v - 0x6F);
   if (v >= 0x60 && v <= 0x69) return 'Num ' + (v - 0x60);
@@ -334,13 +389,23 @@ function render(s) {
   const threads = [['', T('auto') + ' (' + s.cpu_auto + ')']];
   for (let n = 1; n <= s.cpu_max; n++) threads.push([n, String(n)]);
   options($('threads'), threads, s.threads ?? '');
+  options($('form'), [['', T('form_auto')], ['polite', T('form_polite')], ['plain', T('form_plain')]], s.form);
+  $('form_row').hidden = s.target !== 'ja';
+  $('form_row').style.display = s.target === 'ja' ? '' : 'none';
+  options($('font'), [['', T('font_default')], ...s.fonts.map(f => [f, f])], s.font);
+  options($('opacity'), [100, 90, 80, 70, 60, 50].map(v => [v, v + '%']), s.opacity);
+  renderTerms(s);
+  $('history_find').placeholder = T('find');
+  if (page === 'history') renderHistory();
   $('gpu_limit').disabled = s.device !== 'auto';
   $('ui_lang').value = s.ui_lang;
-  for (const id of ['show_frame', 'flash_frame', 'autostart']) $(id).checked = s[id];
+  for (const id of ['show_frame', 'flash_frame', 'autostart', 'bold_text', 'keep_history']) $(id).checked = s[id];
   for (const b of document.querySelectorAll('[data-key]')) {
     const i = +b.dataset.key;
     b.classList.toggle('wait', i === waiting);
     b.textContent = i === waiting ? T('key_wait') : hotkey(s.hotkeys[i]);
+    b.title = s.taken.includes(i) ? T('key_taken') : '';
+    b.classList.toggle('taken', s.taken.includes(i));
   }
   const m = s.models.find(x => x.file === s.model) ?? {};
   const downloading = s.progress >= 0;
@@ -364,6 +429,45 @@ function render(s) {
   $('folder').textContent = s.folder;
   if (!introOpen && s.intro) { introOpen = true; $('intro').classList.add('on'); }
   renderIntro(s, m, downloading);
+}
+let terms = null, past = [];
+function renderTerms(s) {
+  if (terms === null) terms = s.glossary.map(t => [...t]);
+  const box = $('terms');
+  if (document.activeElement?.closest('#terms') && box.children.length === terms.length) return;
+  box.textContent = '';
+  terms.forEach((term, i) => {
+    const row = document.createElement('div');
+    row.className = 'term';
+    const field = (index, hint) => {
+      const input = document.createElement('input');
+      input.type = 'text'; input.value = term[index]; input.placeholder = T(hint);
+      input.onchange = () => { terms[i][index] = input.value; send('glossary', terms); };
+      return input;
+    };
+    const gone = document.createElement('button');
+    gone.className = 'x'; gone.textContent = '×'; gone.setAttribute('aria-label', T('delete'));
+    gone.onclick = () => { terms.splice(i, 1); send('glossary', terms); renderTerms(state); };
+    const arrow = document.createElement('span');
+    arrow.textContent = '→';
+    row.append(field(0, 'term_from'), arrow, field(1, 'term_to'), gone);
+    box.append(row);
+  });
+}
+function renderHistory() {
+  const box = $('history_list'), find = $('history_find').value.toLowerCase();
+  const shown = past.filter(([a, b]) => (a + b).toLowerCase().includes(find));
+  box.textContent = '';
+  if (!shown.length) { const e = document.createElement('div'); e.className = 'past'; e.textContent = T('history_empty'); box.append(e); }
+  for (const [source, translation] of shown) {
+    const e = document.createElement('div');
+    e.className = 'past';
+    const small = document.createElement('small');
+    small.textContent = source;
+    e.append(translation, small);
+    e.onclick = () => { send('copy', translation); e.firstChild.textContent = T('copied'); setTimeout(renderHistory, 700); };
+    box.append(e);
+  }
 }
 function renderIntro(s, m, downloading) {
   if (!introOpen) return;
@@ -399,13 +503,17 @@ function ask(title, text, yes, then) {
 }
 $('ask_yes').onclick = () => { $('ask').close(); pending?.(); };
 $('ask_no').onclick = () => $('ask').close();
-for (const b of document.querySelectorAll('nav button')) b.onclick = () => show(b.dataset.go);
-for (const id of ['source', 'target', 'device']) $(id).onchange = e => { e.target.dataset.sent = e.target.value; send(id, e.target.value); };
+for (const b of document.querySelectorAll('nav button')) b.onclick = () => { show(b.dataset.go); if (page === 'history') send('history'); };
+$('term_add').onclick = () => { terms.push(['', '']); renderTerms(state); $('terms').lastChild?.querySelector('input').focus(); };
+$('history_find').oninput = renderHistory;
+$('history_clear').onclick = () => { send('history_clear'); past = []; renderHistory(); };
+$('opacity').onchange = e => { e.target.dataset.sent = e.target.value; send('opacity', +e.target.value); };
+for (const id of ['source', 'target', 'device', 'form', 'font']) $(id).onchange = e => { e.target.dataset.sent = e.target.value; send(id, e.target.value); };
 $('models').onchange = e => { e.target.dataset.sent = e.target.value; send('model', e.target.value); };
 $('ui_lang').onchange = e => send('ui_lang', e.target.value);
 $('gpu_limit').onchange = e => { e.target.dataset.sent = e.target.value; send('gpu_limit', e.target.value === '' ? null : +e.target.value); };
 $('threads').onchange = e => { e.target.dataset.sent = e.target.value; send('threads', e.target.value === '' ? null : +e.target.value); };
-for (const id of ['show_frame', 'flash_frame', 'autostart']) $(id).onchange = e => send(id, e.target.checked);
+for (const id of ['show_frame', 'flash_frame', 'autostart', 'bold_text', 'keep_history']) $(id).onchange = e => send(id, e.target.checked);
 $('download').onclick = () => {
   if (state.progress >= 0) return send('cancel');
   ask(T('ask_license'), T('ask_license_text'), T('agree'), () => send('download'));
@@ -418,7 +526,7 @@ $('korean_download').onclick = () => send(state.progress >= 0 ? 'cancel' : 'kore
 $('korean_delete').onclick = () => send('korean_delete');
 $('load').onclick = () => send('load');
 $('unload').onclick = () => send('unload');
-for (const a of [$('license'), $('intro_license')]) a.onclick = () => send('open', LICENSE[state.ui_lang] ?? LICENSE.ja);
+for (const a of [$('license'), $('intro_license'), $('work_license')]) a.onclick = () => send('open', LICENSE[state.ui_lang] ?? LICENSE.ja);
 for (const b of document.querySelectorAll('[data-key]')) b.onclick = () => { waiting = +b.dataset.key; render(state); };
 addEventListener('keydown', e => {
   if (waiting < 0) return;
@@ -431,6 +539,14 @@ addEventListener('keydown', e => {
   post({ cmd: 'hotkey', index, mods: (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 4 : 0), key: e.keyCode });
 }, true);
 addEventListener('keyup', e => { if (waiting >= 0) e.preventDefault(); }, true);
+addEventListener('mousedown', e => {
+  const key = { 1: 4, 3: 5, 4: 6 }[e.button];
+  if (waiting < 0 || !key) return;
+  e.preventDefault(); e.stopPropagation();
+  const index = waiting;
+  waiting = -1;
+  post({ cmd: 'hotkey', index, mods: (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 4 : 0), key });
+}, true);
 for (const b of document.querySelectorAll('[data-lang]')) b.onclick = () => send('ui_lang', b.dataset.lang);
 function go(n) { step = n; renderIntro(state, state.models.find(x => x.file === state.model) ?? {}, state.progress >= 0); }
 for (const b of document.querySelectorAll('[data-next]')) b.onclick = () => go(step + 1);
@@ -441,7 +557,9 @@ $('intro_download').onclick = () => {
   send(state.progress >= 0 ? 'cancel' : 'download');
 };
 $('intro_done').onclick = () => { introOpen = false; $('intro').classList.remove('on'); send('intro_done'); };
-chrome.webview.addEventListener('message', e => render(e.data));
+chrome.webview.addEventListener('message', e => {
+  if (e.data.history) { past = e.data.history; renderHistory(); } else render(e.data);
+});
 show(page);
 post({ cmd: 'ready' });
 </script>
