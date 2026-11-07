@@ -61,8 +61,7 @@ pub fn list() -> Vec<Entry> {
 }
 
 pub fn dir() -> PathBuf {
-    let profile = || PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join("screen-translate");
-    crate::config::portable_dir().cloned().unwrap_or_else(profile).join("models")
+    crate::config::portable_dir().cloned().unwrap_or_else(|| crate::config::profile_dir("LOCALAPPDATA")).join("models")
 }
 
 pub fn path(file: &str) -> PathBuf {

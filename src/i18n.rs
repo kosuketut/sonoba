@@ -31,7 +31,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ("標準、1.8GB", "standard, 1.8 GB"),
     ("高品質、5.3GB", "high quality, 5.3 GB"),
     ("最高品質、19.5GB", "best quality, 19.5 GB"),
-    ("screen-translate の設定", "screen-translate settings"),
+    ("Sonoba の設定", "Sonoba settings"),
     ("設定画面を開けません。WebView2 ランタイムが必要です。", "The settings window cannot open. It needs the WebView2 Runtime."),
     ("訳文をコピーしました", "Translation copied"),
     ("コピーする訳文がありません", "No translation to copy"),

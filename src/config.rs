@@ -3,7 +3,7 @@
 use crate::engine::{self, Device, Options};
 use crate::models;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
 
@@ -187,9 +187,20 @@ pub fn portable_dir() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
+/// The app's folder in the user's profile, under the environment variable `root`.
+pub fn profile_dir(root: &str) -> PathBuf {
+    settled_dir(Path::new(&std::env::var_os(root).unwrap_or_default()))
+}
+
+/// The folder was called screen-translate before the rename to Sonoba. It moves over at the first
+/// use, and is used where it is for as long as the old app holds its files open.
+fn settled_dir(root: &Path) -> PathBuf {
+    let (new, old) = (root.join("Sonoba"), root.join("screen-translate"));
+    if new.exists() || !old.exists() || std::fs::rename(&old, &new).is_ok() { new } else { old }
+}
+
 fn path() -> PathBuf {
-    let profile = || PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("screen-translate");
-    portable_dir().cloned().unwrap_or_else(profile).join("config.json")
+    portable_dir().cloned().unwrap_or_else(|| profile_dir("APPDATA")).join("config.json")
 }
 
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
@@ -212,6 +223,27 @@ pub fn update(change: impl FnOnce(&mut Config)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_old_profile_folder_moves_over_once() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("sonoba-test-{}", std::process::id()));
+        let (new, old) = (root.join("Sonoba"), root.join("screen-translate"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("config.json"), "{}").unwrap();
+
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(old.join("config.json")).unwrap();
+        assert_eq!(settled_dir(&root), old);
+        drop(held);
+
+        assert_eq!(settled_dir(&root), new);
+        assert!(new.join("config.json").exists() && !old.exists());
+
+        std::fs::create_dir_all(&old).unwrap(); // the old app, still running, saved its settings
+        assert_eq!(settled_dir(&root), new);
+        assert!(old.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn settings_survive_a_round_trip() {

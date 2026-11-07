@@ -165,7 +165,7 @@ pub fn show(live: bool, running: bool) {
         RUNNING.set(running);
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("ScreenTranslateBar"),
+            w!("SonobaBar"),
             null(),
             WS_POPUP,
             0,
@@ -178,7 +178,7 @@ pub fn show(live: bool, running: bool) {
             null(),
         );
         WINDOW.set(hwnd);
-        if std::env::var_os("SCREEN_TRANSLATE_DEV").is_none() {
+        if std::env::var_os("SONOBA_DEV").is_none() {
             SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         }
         lay_out();
@@ -334,7 +334,7 @@ pub fn register_class() {
         class.cbSize = size_of::<WNDCLASSEXW>() as u32;
         class.lpfnWndProc = Some(proc);
         class.hInstance = GetModuleHandleW(null());
-        class.lpszClassName = w!("ScreenTranslateBar");
+        class.lpszClassName = w!("SonobaBar");
         class.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
         RegisterClassExW(&class);
     }

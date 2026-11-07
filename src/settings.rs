@@ -34,7 +34,8 @@ const MIN_WIDTH: i32 = 640;
 const MIN_HEIGHT: i32 = 480;
 const PAGE: &str = include_str!("settings.html");
 const RUN_KEY: *const u16 = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: *const u16 = w!("screen-translate");
+const RUN_VALUE: *const u16 = w!("Sonoba");
+const OLD_RUN_VALUE: *const u16 = w!("screen-translate");
 const THEME_KEY: *const u16 = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
 const USE_DARK_TITLE_BAR: u32 = 20; // DWMWA_USE_IMMERSIVE_DARK_MODE
 
@@ -56,8 +57,20 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
 }
 
+fn run_value_exists(value: *const u16) -> bool {
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, value, RRF_RT_REG_SZ, null_mut(), null_mut(), null_mut()) == 0 }
+}
+
 fn autostart() -> bool {
-    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, null_mut(), null_mut(), null_mut()) == 0 }
+    run_value_exists(RUN_VALUE)
+}
+
+/// An autostart from before the rename to Sonoba would start the old exe, so it moves to this one.
+pub fn carry_over_autostart() {
+    if run_value_exists(OLD_RUN_VALUE) {
+        set_autostart(true);
+        unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, OLD_RUN_VALUE) };
+    }
 }
 
 fn set_autostart(on: bool) {
@@ -139,7 +152,7 @@ fn state() -> Value {
     };
     let hotkeys: Vec<Value> = config.hotkeys.iter().map(|h| json!({ "mods": h.mods, "key": h.key })).collect();
     json!({
-        "title": t("screen-translate の設定"),
+        "title": t("Sonoba の設定"),
         "version": env!("CARGO_PKG_VERSION"),
         "folder": data_dir().display().to_string(),
         "models": list,
@@ -365,7 +378,7 @@ fn page_ready(hwnd: HWND, controller: ICoreWebView2Controller) -> windows::core:
         settings.SetAreHostObjectsAllowed(false)?;
         settings.SetIsStatusBarEnabled(false)?;
         settings.SetIsZoomControlEnabled(false)?;
-        settings.SetAreDevToolsEnabled(std::env::var_os("SCREEN_TRANSLATE_DEV").is_some())?;
+        settings.SetAreDevToolsEnabled(std::env::var_os("SONOBA_DEV").is_some())?;
         let mut token = 0;
         let received = WebMessageReceivedEventHandler::create(Box::new(|_, args| {
             if let Some(args) = args {
@@ -468,7 +481,7 @@ pub fn register_class() {
         class.cbSize = size_of::<WNDCLASSEXW>() as u32;
         class.lpfnWndProc = Some(proc);
         class.hInstance = GetModuleHandleW(null());
-        class.lpszClassName = w!("ScreenTranslateSettings");
+        class.lpszClassName = w!("SonobaSettings");
         class.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
         class.hIcon = crate::app_icon(Some(BIG_ICON));
         class.hIconSm = crate::app_icon(None);
@@ -484,10 +497,10 @@ pub fn open() {
             SetForegroundWindow(window());
             return;
         }
-        let title = wide(&t("screen-translate の設定"));
+        let title = wide(&t("Sonoba の設定"));
         let hwnd = CreateWindowExW(
             0,
-            w!("ScreenTranslateSettings"),
+            w!("SonobaSettings"),
             title.as_ptr(),
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
@@ -509,7 +522,36 @@ pub fn open() {
         SetTimer(hwnd, TIMER, TIMER_MS, None);
         if start_page(hwnd).is_err() {
             DestroyWindow(hwnd);
-            MessageBoxW(null_mut(), wide(&t("設定画面を開けません。WebView2 ランタイムが必要です。")).as_ptr(), w!("screen-translate"), MB_OK | MB_ICONWARNING);
+            MessageBoxW(null_mut(), wide(&t("設定画面を開けません。WebView2 ランタイムが必要です。")).as_ptr(), w!("Sonoba"), MB_OK | MB_ICONWARNING);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_old_autostart_value_moves_to_the_new_name() {
+        // HKEY_CURRENT_USER points at a throwaway key for this process, so the real autostart entries stay untouched.
+        unsafe {
+            let sandbox = w!("Software\\Sonoba-test");
+            let mut key = null_mut();
+            assert_eq!(RegCreateKeyW(HKEY_CURRENT_USER, sandbox, &mut key), 0);
+            assert_eq!(RegOverridePredefKey(HKEY_CURRENT_USER, key), 0);
+
+            carry_over_autostart();
+            assert!(!autostart(), "nothing to carry over");
+
+            let old = wide("screen-translate.exe");
+            assert_eq!(RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, OLD_RUN_VALUE, REG_SZ, old.as_ptr() as *const _, old.len() as u32 * 2), 0);
+            carry_over_autostart();
+            let (moved, gone) = (autostart(), !run_value_exists(OLD_RUN_VALUE));
+
+            RegOverridePredefKey(HKEY_CURRENT_USER, null_mut());
+            RegCloseKey(key);
+            RegDeleteTreeW(HKEY_CURRENT_USER, sandbox);
+            assert!(moved && gone);
         }
     }
 }

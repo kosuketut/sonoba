@@ -1,6 +1,6 @@
 # Notices
 
-screen-translate itself is under the MIT License (see LICENSE). It uses the following. The full license texts are in the `licenses` folder.
+Sonoba itself is under the MIT License (see LICENSE). It uses the following. The full license texts are in the `licenses` folder.
 
 ## PLaMo 3 Translate
 

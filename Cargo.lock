@@ -340,21 +340,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "screen-translate"
-version = "0.1.0"
-dependencies = [
- "png",
- "rayon",
- "rten",
- "rten-tensor",
- "serde_json",
- "ureq",
- "webview2-com",
- "windows",
- "windows-sys",
-]
-
-[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -407,6 +392,21 @@ name = "smallvec"
 version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
+
+[[package]]
+name = "sonoba"
+version = "0.1.0"
+dependencies = [
+ "png",
+ "rayon",
+ "rten",
+ "rten-tensor",
+ "serde_json",
+ "ureq",
+ "webview2-com",
+ "windows",
+ "windows-sys",
+]
 
 [[package]]
 name = "syn"

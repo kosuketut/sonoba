@@ -1,4 +1,4 @@
-# screen-translate
+# Sonoba
 
 [日本語](README.md) | **English**
 
@@ -10,9 +10,9 @@ Built with PLaMo.
 
 ## Getting started
 
-The supported OS is Windows 11. No installation is required. The Visual C++ runtime is included in the zip file, so it works without installing it separately. Extract the zip file to your preferred folder and launch `screen-translate.exe`. The first time you run it, a guide opens: select the display language, agree to the license, and choose a translation model. Translation is not available until you have agreed.
+The supported OS is Windows 11. No installation is required. The Visual C++ runtime is included in the zip file, so it works without installing it separately. Extract the zip file to your preferred folder and launch `sonoba.exe`. The first time you run it, a guide opens: select the display language, agree to the license, and choose a translation model. Translation is not available until you have agreed.
 
-Settings and models are saved in the `data` folder next to the exe. Deleting the entire folder will also delete the app. To update, overwrite the folder with the contents of a new zip file. If you place the app in a location it cannot write to, such as Program Files, they are saved in the `screen-translate` folders in `%APPDATA%` and `%LOCALAPPDATA%`. If you are using auto-start, disable this in the settings before deleting the folder.
+Settings and models are saved in the `data` folder next to the exe. Deleting the entire folder will also delete the app. To update, overwrite the folder with the contents of a new zip file. If you place the app in a location it cannot write to, such as Program Files, they are saved in the `Sonoba` folders in `%APPDATA%` and `%LOCALAPPDATA%`. If you are using auto-start, disable this in the settings before deleting the folder.
 
 Since this is a downloaded file, you may encounter a SmartScreen warning upon the first launch. Select "Run anyway" under "More info," or check "Unblock" in the zip properties before extracting. On PCs where Smart App Control is enabled, this step is required before extraction.
 

@@ -1,4 +1,4 @@
-# Builds dist/screen-translate-<version>.zip: the app plus the official llama.cpp Vulkan engine,
+# Builds dist/sonoba-<version>.zip: the app plus the official llama.cpp Vulkan engine,
 # with the Visual C++ runtime that engine needs and every license text.
 # The model is not in the package: users download it from the settings window.
 $ErrorActionPreference = 'Stop'
@@ -9,7 +9,7 @@ $runtimeNeeded = [version]'14.51' # ggml-vulkan.dll was built with this, and the
 
 $root = Split-Path $PSScriptRoot
 $version = (Select-String -Path "$root\Cargo.toml" -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-$name = "screen-translate-$version"
+$name = "sonoba-$version"
 $dist = "$root\dist"
 $stage = "$dist\$name"
 
@@ -40,6 +40,6 @@ foreach ($file in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
 & "$PSScriptRoot\licenses.ps1"
 Copy-Item "$root\licenses" $stage -Recurse
 
-Copy-Item "$root\target\release\screen-translate.exe", "$root\README.md", "$root\README.en.md", "$root\LICENSE", "$root\NOTICE.md" $stage
+Copy-Item "$root\target\release\sonoba.exe", "$root\README.md", "$root\README.en.md", "$root\LICENSE", "$root\NOTICE.md" $stage
 Compress-Archive "$stage\*" "$dist\$name.zip" -Force
 Write-Host "dist\$name.zip  $([int]((Get-Item "$dist\$name.zip").Length / 1MB)) MB"

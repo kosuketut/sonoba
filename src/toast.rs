@@ -56,7 +56,7 @@ pub fn show(text: &str) {
         if hwnd.is_null() {
             hwnd = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
-                w!("ScreenTranslateToast"),
+                w!("SonobaToast"),
                 null(),
                 WS_POPUP,
                 0,
@@ -155,7 +155,7 @@ pub fn register_class() {
         class.cbSize = size_of::<WNDCLASSEXW>() as u32;
         class.lpfnWndProc = Some(proc);
         class.hInstance = GetModuleHandleW(null());
-        class.lpszClassName = w!("ScreenTranslateToast");
+        class.lpszClassName = w!("SonobaToast");
         RegisterClassExW(&class);
     }
 }

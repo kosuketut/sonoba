@@ -823,7 +823,7 @@ unsafe fn begin_select(live: bool) {
         let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
         let select = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
-            w!("ScreenTranslateSelect"),
+            w!("SonobaSelect"),
             null(),
             WS_POPUP,
             vx,
@@ -1483,7 +1483,7 @@ unsafe fn tray_icon(hwnd: HWND, action: u32) {
         data.uCallbackMessage = WM_TRAY;
         data.hIcon = app_icon(None);
         let state = if SUSPENDED.load(Ordering::Relaxed) { "一時停止中" } else { "ダブルクリックで設定を開きます" };
-        let tip = wide(&format!("screen-translate\n{}", t(state)));
+        let tip = wide(&format!("Sonoba\n{}", t(state)));
         data.szTip[..tip.len()].copy_from_slice(&tip);
         Shell_NotifyIconW(action, &data);
     }
@@ -1631,11 +1631,11 @@ fn log_panics() {
 /// A second start opens the settings of the first, which is usually what was wanted.
 fn already_running() -> bool {
     unsafe {
-        CreateMutexW(null(), 0, w!("screen-translate.single-instance"));
+        CreateMutexW(null(), 0, w!("Sonoba.single-instance"));
         if GetLastError() != ERROR_ALREADY_EXISTS {
             return false;
         }
-        let first = FindWindowW(w!("ScreenTranslateMain"), null());
+        let first = FindWindowW(w!("SonobaMain"), null());
         PostMessageW(first, WM_TRAY, 0, WM_LBUTTONDBLCLK as isize);
         true
     }
@@ -1646,20 +1646,21 @@ fn main() {
     if already_running() {
         return;
     }
+    settings::carry_over_autostart();
     unsafe {
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32); // WebView2 asks for it
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        register_class(w!("ScreenTranslateMain"), Some(main_proc), IDC_ARROW);
-        register_class(w!("ScreenTranslateSelect"), Some(select_proc), IDC_CROSS);
-        register_class(w!("ScreenTranslateOverlay"), Some(overlay_proc), IDC_ARROW);
-        register_class(w!("ScreenTranslateFrame"), Some(frame_proc), IDC_ARROW);
+        register_class(w!("SonobaMain"), Some(main_proc), IDC_ARROW);
+        register_class(w!("SonobaSelect"), Some(select_proc), IDC_CROSS);
+        register_class(w!("SonobaOverlay"), Some(overlay_proc), IDC_ARROW);
+        register_class(w!("SonobaFrame"), Some(frame_proc), IDC_ARROW);
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
 
         let module = GetModuleHandleW(null());
-        let main = CreateWindowExW(0, w!("ScreenTranslateMain"), w!("screen-translate"), 0, 0, 0, 0, 0, null_mut(), null_mut(), module, null());
+        let main = CreateWindowExW(0, w!("SonobaMain"), w!("Sonoba"), 0, 0, 0, 0, 0, null_mut(), null_mut(), module, null());
         let overlay = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            w!("ScreenTranslateOverlay"),
+            w!("SonobaOverlay"),
             null(),
             WS_POPUP,
             0,
@@ -1673,7 +1674,7 @@ fn main() {
         );
         let frame = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            w!("ScreenTranslateFrame"),
+            w!("SonobaFrame"),
             null(),
             WS_POPUP,
             0,
@@ -1703,7 +1704,7 @@ fn main() {
         let hotkeys_ok = register_hotkeys();
         if !hotkeys_ok {
             let warning = wide_z(&t("ホットキーを登録できません。別のアプリが使っています。設定で変更してください。"));
-            MessageBoxW(null_mut(), warning.as_ptr(), w!("screen-translate"), MB_OK | MB_ICONWARNING);
+            MessageBoxW(null_mut(), warning.as_ptr(), w!("Sonoba"), MB_OK | MB_ICONWARNING);
         }
         let config = config::get();
         if !hotkeys_ok || !config.license_accepted || !models::is_present(&config.model) {
