@@ -46,6 +46,7 @@ const WATCH: Duration = Duration::from_millis(100); // one-shot results, which t
 const PARTIAL_EVERY: Duration = Duration::from_millis(30); // repaints while a page fills in
 const MOVE_SETTLE: Duration = Duration::from_millis(120); // no frames are judged until a drag pauses
 const STALE_PERCENT: usize = 8; // of the pixels: a scrolled page, not a hover highlight or a caret
+const SETTLE: Duration = Duration::from_millis(300);
 const OCR_IDLE: Duration = Duration::from_secs(60); // free the OCR models this long after the last job
 const ENGINE_IDLE: Duration = Duration::from_secs(15 * 60); // and the model after this long
 const MAX_REST: Duration = Duration::from_millis(500); // the longest pause between frames that keep coming
@@ -68,6 +69,7 @@ const WM_PATCHES: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const WM_JOB_OVER: u32 = WM_APP + 3;
 const WM_PEEK_END: u32 = WM_APP + 9;
+const WM_PARTS: u32 = WM_APP + 10;
 const WM_TRANSLATED: u32 = WM_APP + 4;
 const FLASH_TIMER: usize = 1;
 const FLASH_MS: u32 = 450;
@@ -100,6 +102,13 @@ struct Region {
     h: i32,
 }
 
+/// One of several regions. Each keeps the mode it was selected in, as if it were alone.
+#[derive(Clone, Copy, PartialEq)]
+struct Part {
+    region: Region,
+    live: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Job {
     region: Region,
@@ -125,7 +134,7 @@ static UNLOAD: AtomicBool = AtomicBool::new(false);
 static MOVED_AT: Mutex<Option<Instant>> = Mutex::new(None); // the last time the anchor window moved
 static PAUSED: AtomicBool = AtomicBool::new(false); // the anchor window is minimised
 static SUSPENDED: AtomicBool = AtomicBool::new(false); // paused from the tray: no keys, no jobs
-static PARTS: Mutex<Vec<Region>> = Mutex::new(Vec::new()); // the regions of a job with several
+static PARTS: Mutex<Vec<Part>> = Mutex::new(Vec::new()); // the regions of a job with several
 static MOUSE_KEYS: Mutex<Vec<(i32, config::Hotkey)>> = Mutex::new(Vec::new());
 pub static TAKEN_KEYS: Mutex<Vec<usize>> = Mutex::new(Vec::new()); // actions another app holds the key of
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -331,22 +340,53 @@ fn hold_still(patches: &mut Vec<Patch>, (basis, shown): &(Vec<u8>, Vec<Patch>), 
 
 /// Hands changed frames to the worker. Live, every change counts, and text whose pixels have
 /// changed comes off straight away. One-shot, the job ends once most of the page has changed.
-/// Several regions are read as one picture of the area around them, blank between them.
+/// Several regions are read as one picture of the area around them, blank between them: a live
+/// region as it is now, a one-shot region as it first was, so that only live ones get translated
+/// again. Returns the one-shot regions whose page has changed, which are done with.
 // shortcut: regions far apart make a large picture, which OCR scales down; read them one by one
 // if small text across the screen turns out to matter.
-fn keep_parts(frame: &[u8], out: &mut Vec<u8>, width: usize, (x, y): (i32, i32), parts: &[Region]) {
+fn keep_parts(frame: &[u8], out: &mut Vec<u8>, width: usize, (x, y): (i32, i32), parts: &[Part], still: &mut Vec<(Region, Vec<u8>)>) -> Vec<Region> {
     let height = frame.len() / 4 / width;
+    let mut gone = Vec::new();
     out.clear();
     out.resize(frame.len(), 0);
     for part in parts {
+        let region = part.region;
         let span = |from: i32, length: i32, at: i32, limit: usize| ((from - at).clamp(0, limit as i32) as usize, (from + length - at).clamp(0, limit as i32) as usize);
-        let (left, right) = span(part.x, part.w, x, width);
-        let (top, bottom) = span(part.y, part.h, y, height);
-        for row in top..bottom {
-            let cells = (row * width + left) * 4..(row * width + right) * 4;
-            out[cells.clone()].copy_from_slice(&frame[cells]);
+        let (left, right) = span(region.x, region.w, x, width);
+        let (top, bottom) = span(region.y, region.h, y, height);
+        let rows = || (top..bottom).map(|row| (row * width + left) * 4..(row * width + right) * 4);
+        let now: Vec<u8> = rows().flat_map(|cells| frame[cells].iter().copied()).collect();
+        let shown = if part.live {
+            now
+        } else {
+            match still.iter().find(|(r, _)| *r == region) {
+                Some((_, first)) if changed_pixels(&now, first) * 100 > first.len() / 4 * STALE_PERCENT => {
+                    gone.push(region);
+                    continue;
+                }
+                Some((_, first)) => first.clone(),
+                None => {
+                    still.push((region, now.clone()));
+                    now
+                }
+            }
+        };
+        let line = (right - left) * 4;
+        if line > 0 {
+            for (cells, row) in rows().zip(shown.chunks_exact(line)) {
+                out[cells].copy_from_slice(row);
+            }
         }
     }
+    gone
+}
+
+/// A one-shot region of a job that also has live ones is as still as a one-shot job.
+fn in_still_part(glyphs: &patch::Glyphs) -> bool {
+    let Some(job) = *JOB.lock().unwrap() else { return false };
+    let (x, y) = (job.region.x + glyphs.x, job.region.y + glyphs.y);
+    PARTS.lock().unwrap().iter().any(|p| !p.live && x >= p.region.x && x < p.region.x + p.region.w && y >= p.region.y && y < p.region.y + p.region.h)
 }
 
 fn watch(job: Job, overlay: usize, shared: &Shared) {
@@ -363,6 +403,8 @@ fn watch(job: Job, overlay: usize, shared: &Shared) {
     let mut size = (0, 0);
     let mut last: Vec<u8> = Vec::new();
     let mut parted: Vec<u8> = Vec::new();
+    let mut still: Vec<(Region, Vec<u8>)> = Vec::new();
+    let started = Instant::now();
     while let Some(current) = current_job(job.id) {
         let Region { x, y, w, h } = current.region;
         if w <= 0 || h <= 0 {
@@ -397,8 +439,19 @@ fn watch(job: Job, overlay: usize, shared: &Shared) {
             }
             let parts = PARTS.lock().unwrap().clone();
             if !parts.is_empty() {
-                keep_parts(frame, &mut parted, w as usize, (x, y), &parts);
+                // The selection layer takes a moment to leave the screen, so the first looks count for nothing.
+                if started.elapsed() < SETTLE {
+                    still.clear();
+                }
+                let gone = keep_parts(frame, &mut parted, w as usize, (x, y), &parts, &mut still);
                 frame = &parted;
+                if !gone.is_empty() {
+                    PARTS.lock().unwrap().retain(|p| !gone.contains(&p.region));
+                    if gone.len() == parts.len() {
+                        return finish();
+                    }
+                    unsafe { PostMessageW(overlay as HWND, WM_PARTS, job.id as usize, 0) };
+                }
             }
             if frame != last {
                 let first = last.is_empty();
@@ -416,7 +469,8 @@ fn watch(job: Job, overlay: usize, shared: &Shared) {
                 }
             }
         }
-        std::thread::sleep(if job.live || last.is_empty() { POLL } else { WATCH });
+        let watching = job.live && (PARTS.lock().unwrap().is_empty() || PARTS.lock().unwrap().iter().any(|p| p.live));
+        std::thread::sleep(if watching || last.is_empty() { POLL } else { WATCH });
     }
 }
 
@@ -479,7 +533,7 @@ fn translate_frame(
     let patch = |block: &ocr::Block, text: &str| {
         (text.to_lowercase() != block.text.to_lowercase()).then(|| {
             let patch = Patch::new(frame, w, h, block, text.to_string());
-            if block.glyphs.picture && !live { patch.keep_picture(frame, w, h) } else { patch }
+            if block.glyphs.picture && (!live || in_still_part(&block.glyphs)) { patch.keep_picture(frame, w, h) } else { patch }
         })
     };
     // Whatever is known already goes up with the first new line, so nothing flickers.
@@ -523,6 +577,7 @@ struct Ui {
     frame: Cell<HWND>,
     selecting: Cell<Option<Region>>, // the drag so far, in screen pixels
     peeking: Cell<bool>, // the original is on show while a key is held
+    shift_seen: Cell<bool>, // Shift was down during the drag in progress
     resume: Cell<Option<Region>>, // the live job to start again after a pause
     mouse_hook: Cell<HHOOK>,
     flashing: Cell<bool>,
@@ -546,6 +601,7 @@ thread_local! {
         frame: Cell::new(null_mut()),
         selecting: Cell::new(None),
         peeking: Cell::new(false),
+        shift_seen: Cell::new(false),
         resume: Cell::new(None),
         mouse_hook: Cell::new(null_mut()),
         flashing: Cell::new(false),
@@ -641,7 +697,10 @@ unsafe fn paint_frame(hwnd: HWND) {
         GetWindowRect(hwnd, &mut corner);
         let selecting = UI.with(|ui| ui.selecting.get().is_some());
         let parts = if selecting { Vec::new() } else { PARTS.lock().unwrap().clone() };
-        let around = |p: &Region| RECT { left: p.x - t - corner.left, top: p.y - t - corner.top, right: p.x + p.w + t - corner.left, bottom: p.y + p.h + t - corner.top };
+        let around = |p: &Part| {
+            let p = p.region;
+            RECT { left: p.x - t - corner.left, top: p.y - t - corner.top, right: p.x + p.w + t - corner.left, bottom: p.y + p.h + t - corner.top }
+        };
         let boxes = if parts.is_empty() { vec![r] } else { parts.iter().map(around).collect() };
         for b in boxes {
             fill(hdc, &RECT { bottom: b.top + t, ..b }, color);
@@ -740,9 +799,13 @@ unsafe extern "system" fn on_location(_: HWINEVENTHOOK, _: u32, window: HWND, ob
 unsafe fn begin_select(live: bool) {
     UI.with(|ui| unsafe {
         if !ui.select.get().is_null() {
-            // The hotkey again, instead of a drag: the same region as last time.
+            // The hotkey again, instead of a drag: the same region as last time. For what is
+            // already live that can only mean enough of it.
             let keep_live = live || bar::live();
             end_select();
+            if live && ui.live.get() {
+                return stop();
+            }
             let region = ui.region.get();
             // The window may have gone since: what is left is the place on the screen.
             ui.anchor.set(ui.anchor.get().filter(|a| !window_is_gone(a.window) && IsIconic(a.window) == 0));
@@ -845,7 +908,7 @@ unsafe fn finish_select(hwnd: HWND) {
         ClientToScreen(hwnd, &mut origin);
         let live = bar::live();
         // Shift adds to what is running. A job with several regions stays where it is on screen.
-        let adding = GetAsyncKeyState(VK_SHIFT as i32) < 0 && ui.job_id.get() != 0;
+        let adding = (ui.shift_seen.get() || shift_down()) && ui.job_id.get() != 0;
         let clicked = is_small(&rect);
         let mut anchor = None;
         if clicked {
@@ -875,13 +938,13 @@ unsafe fn finish_select(hwnd: HWND) {
         if adding {
             let mut parts = PARTS.lock().unwrap().clone();
             if parts.is_empty() {
-                parts.push(ui.region.get());
+                parts.push(Part { region: ui.region.get(), live: ui.live.get() });
             }
-            parts.push(region);
+            parts.push(Part { region, live });
             let around = around_all(&parts);
             *PARTS.lock().unwrap() = parts;
             ui.anchor.set(None);
-            start_job(around, live || ui.live.get());
+            start_job(around, live);
         } else {
             PARTS.lock().unwrap().clear();
             ui.anchor.set(anchor);
@@ -890,11 +953,17 @@ unsafe fn finish_select(hwnd: HWND) {
     });
 }
 
-fn around_all(parts: &[Region]) -> Region {
-    let left = parts.iter().map(|p| p.x).min().unwrap_or(0);
-    let top = parts.iter().map(|p| p.y).min().unwrap_or(0);
-    let right = parts.iter().map(|p| p.x + p.w).max().unwrap_or(0);
-    let bottom = parts.iter().map(|p| p.y + p.h).max().unwrap_or(0);
+/// Shift counts if it was down at any point of the drag: fingers rarely leave it and the mouse
+/// button at the same moment, and the state of the key is only ever the state right now.
+fn shift_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_SHIFT as i32) < 0 }
+}
+
+fn around_all(parts: &[Part]) -> Region {
+    let left = parts.iter().map(|p| p.region.x).min().unwrap_or(0);
+    let top = parts.iter().map(|p| p.region.y).min().unwrap_or(0);
+    let right = parts.iter().map(|p| p.region.x + p.region.w).max().unwrap_or(0);
+    let bottom = parts.iter().map(|p| p.region.y + p.region.h).max().unwrap_or(0);
     Region { x: left, y: top, w: right - left, h: bottom - top }
 }
 
@@ -909,7 +978,11 @@ fn start_job(region: Region, live: bool) {
         let anchor = ui.anchor.get();
         ui.region.set(region);
         ui.job_id.set(id);
-        ui.live.set(live);
+        // With several regions the job runs as live, and keep_parts holds the one-shot ones still.
+        let parts = PARTS.lock().unwrap().clone();
+        let live_now = if parts.is_empty() { live } else { parts.iter().any(|p| p.live) };
+        let live = live || !parts.is_empty();
+        ui.live.set(live_now);
         PAUSED.store(false, Ordering::Relaxed);
         if let Some(anchor) = anchor {
             let mut process = 0;
@@ -953,6 +1026,7 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 UI.with(|ui| {
                     ui.drag_from.set(Some(at));
                     ui.drag_to.set(at);
+                    ui.shift_seen.set(shift_down());
                 });
                 SetCapture(hwnd);
                 0
@@ -961,6 +1035,7 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let at = lparam_xy(l);
                 let dragging = UI.with(|ui| {
                     ui.drag_from.get().inspect(|&from| {
+                        ui.shift_seen.set(ui.shift_seen.get() || shift_down());
                         let old = selection_rect(from, ui.drag_to.replace(at));
                         if let Some((left, top, right, bottom)) = ui.hover.get().filter(|_| !is_small(&selection_rect(from, at))) {
                             InvalidateRect(hwnd, &RECT { left, top, right, bottom }, 0);
@@ -1326,6 +1401,16 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 }
                 0
             }
+            WM_PARTS => {
+                if UI.with(|ui| ui.job_id.get()) == w as u64 {
+                    let live = PARTS.lock().unwrap().iter().any(|p| p.live);
+                    UI.with(|ui| {
+                        ui.live.set(live);
+                        InvalidateRect(ui.frame.get(), null(), 0);
+                    });
+                }
+                0
+            }
             WM_TRANSLATED => {
                 if UI.with(|ui| ui.job_id.get()) == w as u64 && config::get().flash_frame {
                     UI.with(|ui| {
@@ -1407,7 +1492,6 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             WM_HOTKEY => {
                 match w as i32 {
                     HK_ONCE => begin_select(false),
-                    HK_LIVE if UI.with(|ui| ui.live.get() && ui.select.get().is_null()) => stop(),
                     HK_LIVE => begin_select(true),
                     HK_STOP => {
                         end_select();
@@ -1639,15 +1723,37 @@ mod tests {
         let (width, height) = (10usize, 4usize);
         let frame = vec![9u8; width * height * 4];
         let mut out = Vec::new();
-        let parts = [Region { x: 102, y: 201, w: 2, h: 1 }, Region { x: 108, y: 203, w: 5, h: 5 }];
-        keep_parts(&frame, &mut out, width, (100, 200), &parts);
+        let parts = [Part { region: Region { x: 102, y: 201, w: 2, h: 1 }, live: true }, Part { region: Region { x: 108, y: 203, w: 5, h: 5 }, live: false }];
+        keep_parts(&frame, &mut out, width, (100, 200), &parts, &mut Vec::new());
         let kept: Vec<(usize, usize)> = (0..width * height).filter(|i| out[i * 4] == 9).map(|i| (i % width, i / width)).collect();
         assert_eq!(kept, [(2, 1), (3, 1), (8, 3), (9, 3)]);
     }
 
     #[test]
+    fn a_one_shot_region_holds_still_beside_a_live_one_until_its_page_changes() {
+        let width = 40usize;
+        let region = |x, live| Part { region: Region { x, y: 0, w: 20, h: 4 }, live };
+        let parts = [region(0, true), region(20, false)];
+        let (mut out, mut still) = (Vec::new(), Vec::new());
+        let mut frame = vec![1u8; width * 4 * 4];
+        assert!(keep_parts(&frame, &mut out, width, (0, 0), &parts, &mut still).is_empty());
+
+        // A pixel changes in each: the live region shows it, the one-shot one does not.
+        for at in [0, 39] {
+            frame[at * 4] = 200;
+        }
+        assert!(keep_parts(&frame, &mut out, width, (0, 0), &parts, &mut still).is_empty());
+        assert_eq!((out[0], out[39 * 4]), (200, 1));
+
+        // Most of the one-shot region changes, so it is done with.
+        frame.iter_mut().for_each(|v| *v = 200);
+        assert_eq!(keep_parts(&frame, &mut out, width, (0, 0), &parts, &mut still).len(), 1);
+    }
+
+    #[test]
     fn the_box_around_regions_holds_them_all() {
-        let parts = [Region { x: 10, y: 50, w: 5, h: 5 }, Region { x: -4, y: 60, w: 2, h: 2 }];
+        let part = |x, y, w, h| Part { region: Region { x, y, w, h }, live: false };
+        let parts = [part(10, 50, 5, 5), part(-4, 60, 2, 2)];
         let b = around_all(&parts);
         assert_eq!((b.x, b.y, b.w, b.h), (-4, 50, 19, 12));
     }
