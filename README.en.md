@@ -98,7 +98,7 @@ These are the values when running PLaMo 3 Translate 2B on the GPU of an RTX 4070
 
 | Item | Value |
 | --- | --- |
-| Translation of 1 sentence (from defining the region to displaying it) | 0.1–0.3 s |
+| Translation of 1 sentence (after the model is loaded, from defining the region to displaying it) | About 0.2 s for a 760×60 region (0.17–0.28 s for 2B, 0.14–0.23 s for 0.8B). About 0.5 s for a 1280×720 region (0.43–0.76 s for 2B, 0.38–0.54 s for 0.8B). About 0.13 s for a 760×60 region when translating the same sentence again. |
 | Live updates (2 lines of subtitles, from text change to display) | Approx. 0.8 s (0.77–0.87 s for 2B, 0.66–0.83 s for 0.8B). Most of it is OCR, at 0.5–0.65 s. |
 | Translating one figure | 2B is about 2 seconds, 0.8B is about 1 second |
 | From the moment the screen changes until the old translation disappears | about 0.04 seconds |
