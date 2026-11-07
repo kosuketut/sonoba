@@ -5,6 +5,7 @@ use crate::models;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
 
 const MOD_ALT: u32 = 1;
 const MOD_CONTROL: u32 = 2;
@@ -25,7 +26,16 @@ pub struct Config {
     pub flash_frame: bool, // the frame for a moment whenever a translation finishes
     pub source: String, // what to read: "auto", "ja" (translate Japanese too) or "ko"
     pub target: String, // a language code of the model, "ja(easy)" included
+    pub ui_lang: String, // "ja" or "en"
+    pub intro_done: bool, // the first-run guide was seen through
     pub hotkeys: [Hotkey; 3], // one shot, live, clear
+}
+
+/// Japanese on a Japanese Windows, English on any other.
+fn system_language() -> &'static str {
+    const PRIMARY: u16 = 0x3FF;
+    const JAPANESE: u16 = 0x11;
+    if unsafe { GetUserDefaultUILanguage() } & PRIMARY == JAPANESE { "ja" } else { "en" }
 }
 
 impl Default for Config {
@@ -40,6 +50,8 @@ impl Default for Config {
             flash_frame: false,
             source: "auto".to_string(),
             target: "ja".to_string(),
+            ui_lang: system_language().to_string(),
+            intro_done: false,
             hotkeys: [ctrl_alt('T'), ctrl_alt('R'), ctrl_alt('X')],
         }
     }
@@ -68,6 +80,10 @@ impl Config {
         if let Some(target) = saved["target"].as_str() {
             config.target = target.to_string();
         }
+        if let Some(language) = saved["ui_lang"].as_str() {
+            config.ui_lang = language.to_string();
+        }
+        config.intro_done = saved["intro_done"].as_bool().unwrap_or(false);
         for (slot, name) in config.hotkeys.iter_mut().zip(["once", "live", "clear"]) {
             if let (Some(mods), Some(key)) = (saved[name]["mods"].as_u64(), saved[name]["key"].as_u64()) {
                 *slot = Hotkey { mods: mods as u32, key: key as u32 };
@@ -92,6 +108,8 @@ impl Config {
             "flash_frame": self.flash_frame,
             "source": self.source,
             "target": self.target,
+            "ui_lang": self.ui_lang,
+            "intro_done": self.intro_done,
             "once": hotkey(&self.hotkeys[0]),
             "live": hotkey(&self.hotkeys[1]),
             "clear": hotkey(&self.hotkeys[2]),
@@ -159,6 +177,8 @@ mod tests {
         config.flash_frame = true;
         config.source = "ko".into();
         config.target = "ja(easy)".into();
+        config.ui_lang = "en".into();
+        config.intro_done = true;
         config.hotkeys[1] = Hotkey { mods: 6, key: 0x70 };
         assert_eq!(Config::parse(&config.to_json()), config);
     }

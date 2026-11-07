@@ -15,6 +15,10 @@ The model is not included in this repository or in release packages. The app dow
 - PaddleOCR: <https://github.com/PaddlePaddle/PaddleOCR>
 - RapidOCR: <https://github.com/RapidAI/RapidOCR>
 
+`models/korean_PP-OCRv5_mobile_rec.onnx` is PaddlePaddle's official ONNX export, and `models/dict_korean.txt` its character list, also under the Apache License 2.0.
+
+- <https://huggingface.co/PaddlePaddle/korean_PP-OCRv5_mobile_rec_onnx>
+
 ## llama.cpp
 
 Release packages contain an unmodified Vulkan build of llama.cpp in `engine/`, under the MIT License.
@@ -23,4 +27,4 @@ Release packages contain an unmodified Vulkan build of llama.cpp in `engine/`, u
 
 ## Rust crates
 
-The app links rten, ureq, serde_json, rayon and windows-sys, among others, under the MIT and Apache-2.0 licenses. `cargo tree` lists them all.
+The app links rten, ureq, serde_json, rayon, windows-sys and webview2-com, among others, under the MIT and Apache-2.0 licenses. `cargo tree` lists them all.

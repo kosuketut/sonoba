@@ -1,5 +1,6 @@
 //! The models: PLaMo 3 Translate in its four sizes, plus any GGUF file dropped into the folder.
 
+use crate::i18n::t;
 use serde_json::Value;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -43,7 +44,7 @@ fn catalog_file(size: &str) -> String {
 pub fn list() -> Vec<Entry> {
     let mut entries: Vec<Entry> = CATALOG
         .iter()
-        .map(|(size, note)| Entry { file: catalog_file(size), label: format!("PLaMo 3 Translate {}（{note}）", size.to_uppercase()) })
+        .map(|(size, note)| Entry { file: catalog_file(size), label: format!("PLaMo 3 Translate {} ({})", size.to_uppercase(), t(note)) })
         .collect();
     if let Ok(folder) = std::fs::read_dir(dir()) {
         for file in folder.flatten().filter_map(|f| f.file_name().into_string().ok()) {

@@ -6,15 +6,18 @@
 //! original text underneath the translation.
 #![windows_subsystem = "windows"]
 
+mod bar;
 mod capture;
 mod config;
 mod engine;
+mod i18n;
 mod models;
 mod ocr;
 mod patch;
 mod settings;
 mod translate;
 
+use i18n::t;
 use patch::{Backdrop, KEY_COLOR, Patch, WOBBLE_PERCENT};
 use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
@@ -24,6 +27,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::*;
 use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
@@ -461,9 +465,9 @@ fn translate_frame(
     let mut out: Vec<Patch> = shared.into_inner().unwrap().0.into_iter().flatten().collect();
     // What did finish stays on show: one failed reply is no reason to lose the page.
     if let Err(e) = result {
-        out.push(Patch::status(&format!("エラー: {e}"), w as i32));
+        out.push(Patch::status(&format!("{}{}", t("エラー: "), t(&e)), w as i32));
     } else if out.is_empty() && !live {
-        out.push(Patch::status(NOT_FOUND, w as i32));
+        out.push(Patch::status(&t(NOT_FOUND), w as i32));
     }
     Ok(out)
 }
@@ -477,7 +481,6 @@ struct Ui {
     selecting: Cell<Option<Region>>, // the drag so far, in screen pixels
     flashing: Cell<bool>,
     select: Cell<HWND>,
-    live_next: Cell<bool>, // the selection in progress starts a live job
     drag_from: Cell<Option<(i32, i32)>>,
     drag_to: Cell<(i32, i32)>,
     hover: Cell<Option<(i32, i32, i32, i32)>>, // the window a click would select, in client pixels
@@ -498,7 +501,6 @@ thread_local! {
         selecting: Cell::new(None),
         flashing: Cell::new(false),
         select: Cell::new(null_mut()),
-        live_next: Cell::new(false),
         drag_from: Cell::new(None),
         drag_to: Cell::new((0, 0)),
         hover: Cell::new(None),
@@ -675,18 +677,18 @@ unsafe fn begin_select(live: bool) {
     UI.with(|ui| unsafe {
         if !ui.select.get().is_null() {
             // The hotkey again, instead of a drag: the same region as last time.
+            let keep_live = live || bar::live();
             end_select();
             let region = ui.region.get();
             // The window may have gone since: what is left is the place on the screen.
             ui.anchor.set(ui.anchor.get().filter(|a| !window_is_gone(a.window) && IsIconic(a.window) == 0));
             let followed = ui.anchor.get().and_then(|anchor| anchored_region(anchor, region));
             if region.w > 0 {
-                start_job(followed.unwrap_or(region), live);
+                start_job(followed.unwrap_or(region), keep_live);
             }
             return;
         }
         request_load(); // ready by the time the drag ends
-        ui.live_next.set(live);
         let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
         let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
         let select = CreateWindowExW(
@@ -711,6 +713,7 @@ unsafe fn begin_select(live: bool) {
         RegisterHotKey(ui.main.get(), HK_ESC, 0, VK_ESCAPE as u32);
         ShowWindow(select, SW_SHOWNOACTIVATE);
         update_hover(select);
+        bar::show(live);
     });
 }
 
@@ -759,6 +762,7 @@ unsafe fn end_select() {
         if !select.is_null() {
             ReleaseCapture();
             DestroyWindow(select);
+            bar::hide();
         }
         ui.selecting.set(None);
         update_frame();
@@ -775,7 +779,7 @@ unsafe fn finish_select(hwnd: HWND) {
         let mut rect = selection_rect(from, ui.drag_to.get());
         let mut origin = POINT { x: 0, y: 0 };
         ClientToScreen(hwnd, &mut origin);
-        let live = ui.live_next.get();
+        let live = bar::live();
         let clicked = is_small(&rect);
         let mut anchor = None;
         if clicked {
@@ -825,7 +829,7 @@ fn start_job(region: Region, live: bool) {
             let thread = GetWindowThreadProcessId(anchor.window, &mut process);
             ui.hook.set(SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, null_mut(), Some(on_location), process, thread, WINEVENT_OUTOFCONTEXT));
         }
-        show_patches(vec![Patch::status(WORKING, region.w)]);
+        show_patches(vec![Patch::status(&t(WORKING), region.w)]);
         set_job(Some(Job { region, live, id, window: anchor.map_or(0, |a| a.window as usize) }));
         update_frame();
     });
@@ -1119,8 +1123,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
 unsafe fn tray_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("設定"));
-        AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("終了"));
+        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, wide(&t("設定")).as_ptr());
+        AppendMenuW(menu, MF_STRING, MENU_EXIT, wide(&t("終了")).as_ptr());
         let mut at = POINT { x: 0, y: 0 };
         GetCursorPos(&mut at);
         SetForegroundWindow(hwnd); // Windows only dismisses a tray menu properly this way
@@ -1136,6 +1140,19 @@ unsafe fn tray_menu(hwnd: HWND) {
     }
 }
 
+/// The icon in app.res, at the size given or Windows' size for a tray icon.
+pub fn app_icon(size: Option<i32>) -> HICON {
+    unsafe {
+        let side = size.unwrap_or_else(|| GetSystemMetrics(SM_CXSMICON));
+        LoadImageW(GetModuleHandleW(null()), 1 as *const u16, IMAGE_ICON, side, side, LR_DEFAULTCOLOR) as HICON
+    }
+}
+
+/// The tray's text follows the language. The rest is written when next shown.
+pub fn language_changed() {
+    UI.with(|ui| unsafe { tray_icon(ui.main.get(), NIM_MODIFY) });
+}
+
 unsafe fn tray_icon(hwnd: HWND, action: u32) {
     unsafe {
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();
@@ -1143,8 +1160,8 @@ unsafe fn tray_icon(hwnd: HWND, action: u32) {
         data.hWnd = hwnd;
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
-        data.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
-        let tip = wide("screen-translate\nダブルクリックで設定を開きます");
+        data.hIcon = app_icon(None);
+        let tip = wide(&format!("screen-translate\n{}", t("ダブルクリックで設定を開きます")));
         data.szTip[..tip.len()].copy_from_slice(&tip);
         Shell_NotifyIconW(action, &data);
     }
@@ -1280,6 +1297,7 @@ fn main() {
         return;
     }
     unsafe {
+        CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32); // WebView2 asks for it
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         register_class(w!("ScreenTranslateMain"), Some(main_proc), IDC_ARROW);
         register_class(w!("ScreenTranslateSelect"), Some(select_proc), IDC_CROSS);
@@ -1328,9 +1346,11 @@ fn main() {
 
         tray_icon(main, NIM_ADD);
         settings::register_class();
+        bar::register_class();
         let hotkeys_ok = register_hotkeys();
         if !hotkeys_ok {
-            MessageBoxW(null_mut(), w!("ホットキーを登録できません。別のアプリが使っています。設定で変更してください。"), w!("screen-translate"), MB_OK | MB_ICONWARNING);
+            let warning = wide(&t("ホットキーを登録できません。別のアプリが使っています。設定で変更してください。"));
+            MessageBoxW(null_mut(), warning.as_ptr(), w!("screen-translate"), MB_OK | MB_ICONWARNING);
         }
         if !hotkeys_ok || !models::is_present(&config::get().model) {
             settings::open();
@@ -1341,11 +1361,8 @@ fn main() {
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            let settings = settings::window();
-            if settings.is_null() || IsDialogMessageW(settings, &msg) == 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
     }
 }

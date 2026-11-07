@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>screen-translate</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f3f4f3; --side: #e9ebe9; --card: #ffffff; --line: #dfe2df; --text: #1c211e; --soft: #5f6862;
+  --accent: #1f9d57; --accent-text: #ffffff; --accent-soft: #e0f3e8; --danger: #c43b3b; --field: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1e1c; --side: #151816; --card: #252927; --line: #363b38; --text: #eef1ef; --soft: #a2aba6;
+    --accent: #37c37a; --accent-text: #0d1a12; --accent-soft: #1f3a2b; --danger: #ef7a7a; --field: #1e2220;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font: 14px/1.55 "Segoe UI Variable Text", "Segoe UI", "Yu Gothic UI", "Malgun Gothic", sans-serif;
+  color: var(--text); background: var(--bg); display: flex; overflow: hidden; user-select: none;
+}
+nav { width: 188px; flex: none; background: var(--side); padding: 20px 10px; display: flex; flex-direction: column; gap: 2px; }
+nav .brand { font-weight: 650; font-size: 15px; padding: 0 12px 16px; display: flex; align-items: center; gap: 9px; }
+nav .brand i { width: 12px; height: 12px; border: 2.5px solid var(--accent); border-radius: 3px; display: block; }
+nav button {
+  all: unset; padding: 8px 12px; border-radius: 7px; cursor: pointer; color: var(--soft); position: relative;
+}
+nav button:hover { background: color-mix(in srgb, var(--text) 7%, transparent); color: var(--text); }
+nav button[aria-current=true] { background: var(--card); color: var(--text); font-weight: 600; }
+nav button[aria-current=true]::before {
+  content: ""; position: absolute; left: 0; top: 9px; bottom: 9px; width: 3px; border-radius: 2px; background: var(--accent);
+}
+nav button:focus-visible { outline: 2px solid var(--accent); }
+main { flex: 1; overflow-y: auto; padding: 26px 30px 30px; }
+section { display: none; max-width: 640px; }
+section.on { display: block; }
+h1 { font-size: 20px; font-weight: 650; margin: 0 0 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 14px; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 12px 16px; min-height: 52px; }
+.row + .row { border-top: 1px solid var(--line); }
+.row > div:first-child { min-width: 0; }
+.row b { font-weight: 550; display: block; }
+.row small, .hint { color: var(--soft); font-size: 12.5px; display: block; }
+.hint { margin: -4px 2px 14px; line-height: 1.6; }
+select, .key {
+  font: inherit; color: var(--text); background: var(--field); border: 1px solid var(--line); border-radius: 7px;
+  padding: 6px 10px; min-width: 210px; max-width: 320px;
+}
+select { cursor: pointer; }
+.key { cursor: pointer; text-align: center; font-variant-numeric: tabular-nums; }
+.key.wait { border-color: var(--accent); color: var(--accent); }
+select:focus-visible, .key:focus-visible, .btn:focus-visible, .choice:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.btn {
+  font: inherit; border: 1px solid var(--line); background: var(--field); color: var(--text); border-radius: 7px;
+  padding: 6px 14px; cursor: pointer;
+}
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn.main { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.btn.danger { color: var(--danger); }
+.btn:disabled { opacity: .45; cursor: default; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; padding: 4px 16px 14px; }
+.status { padding: 0 16px 10px; color: var(--soft); font-size: 13px; }
+.bar { height: 5px; background: var(--line); border-radius: 3px; margin: 0 16px 10px; overflow: hidden; display: none; }
+.bar i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .2s; }
+.switch { position: relative; width: 40px; height: 22px; flex: none; }
+.switch input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.switch i { position: absolute; inset: 0; border-radius: 11px; background: var(--line); transition: background .15s; pointer-events: none; }
+.switch i::after {
+  content: ""; position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 2px #0005; transition: left .15s;
+}
+.switch input:checked + i { background: var(--accent); }
+.switch input:checked + i::after { left: 21px; }
+.switch input:focus-visible + i { outline: 2px solid var(--accent); outline-offset: 2px; }
+.message { color: var(--danger); margin: 0 2px 12px; min-height: 0; }
+a { color: var(--accent); cursor: pointer; text-decoration: underline; }
+dialog {
+  border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--text); padding: 20px 22px; max-width: 440px;
+}
+dialog::backdrop { background: #0006; }
+dialog h2 { margin: 0 0 8px; font-size: 16px; }
+dialog p { margin: 0 0 10px; }
+dialog .actions { padding: 8px 0 0; justify-content: flex-end; }
+#intro {
+  position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; padding: 24px; z-index: 5;
+}
+#intro.on { display: flex; }
+#intro .panel { width: 100%; max-width: 520px; max-height: 100%; overflow-y: auto; }
+#intro h1 { font-size: 24px; margin-bottom: 6px; }
+#intro p { color: var(--soft); margin: 0 0 16px; }
+.step { display: none; }
+.step.on { display: block; }
+.choice {
+  all: unset; display: flex; justify-content: space-between; gap: 12px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--card); margin-bottom: 8px; cursor: pointer; width: 100%; box-sizing: border-box;
+}
+.choice[aria-pressed=true] { border-color: var(--accent); background: var(--accent-soft); }
+.choice small { color: var(--soft); }
+.steps { color: var(--soft); font-size: 12.5px; margin-bottom: 18px; }
+.foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 14px; }
+.keys { display: grid; grid-template-columns: auto 1fr; gap: 8px 14px; margin-bottom: 14px; }
+kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); white-space: nowrap; }
+</style>
+</head>
+<body>
+<nav>
+  <div class="brand"><i></i>screen-translate</div>
+  <button data-go="translate" data-t="nav_translate"></button>
+  <button data-go="model" data-t="nav_model"></button>
+  <button data-go="keys" data-t="nav_keys"></button>
+  <button data-go="look" data-t="nav_look"></button>
+  <button data-go="run" data-t="nav_run"></button>
+  <button data-go="about" data-t="nav_about"></button>
+</nav>
+<main>
+  <p class="message" id="message" hidden></p>
+
+  <section id="translate">
+    <h1 data-t="nav_translate"></h1>
+    <div class="card">
+      <div class="row"><div><b data-t="source"></b><small data-t="source_note"></small></div><select id="source"></select></div>
+      <div class="row"><div><b data-t="target"></b></div><select id="target"></select></div>
+    </div>
+    <p class="hint" data-t="easy_note"></p>
+  </section>
+
+  <section id="model">
+    <h1 data-t="nav_model"></h1>
+    <div class="card">
+      <div class="row"><div><b data-t="model"></b></div><select id="models"></select></div>
+      <div class="bar" id="bar"><i></i></div>
+      <div class="status" id="status"></div>
+      <div class="actions">
+        <button class="btn main" id="download"></button>
+        <button class="btn danger" id="delete" data-t="delete"></button>
+        <button class="btn" id="load" data-t="load"></button>
+        <button class="btn" id="unload" data-t="unload"></button>
+      </div>
+    </div>
+    <p class="hint" data-t="model_note"></p>
+  </section>
+
+  <section id="keys">
+    <h1 data-t="nav_keys"></h1>
+    <div class="card">
+      <div class="row"><div><b data-t="key_once"></b></div><button class="key" data-key="0"></button></div>
+      <div class="row"><div><b data-t="key_live"></b></div><button class="key" data-key="1"></button></div>
+      <div class="row"><div><b data-t="key_clear"></b></div><button class="key" data-key="2"></button></div>
+    </div>
+    <p class="hint" data-t="key_note"></p>
+  </section>
+
+  <section id="look">
+    <h1 data-t="nav_look"></h1>
+    <div class="card">
+      <div class="row"><div><b data-t="show_frame"></b><small data-t="show_frame_note"></small></div><label class="switch"><input type="checkbox" id="show_frame"><i></i></label></div>
+      <div class="row"><div><b data-t="flash_frame"></b></div><label class="switch"><input type="checkbox" id="flash_frame"><i></i></label></div>
+    </div>
+  </section>
+
+  <section id="run">
+    <h1 data-t="nav_run"></h1>
+    <div class="card">
+      <div class="row"><div><b data-t="device"></b></div><select id="device"></select></div>
+      <div class="row"><div><b data-t="gpu_limit"></b></div><select id="gpu_limit"></select></div>
+      <div class="row"><div><b data-t="threads"></b></div><select id="threads"></select></div>
+    </div>
+    <div class="card">
+      <div class="row"><div><b data-t="autostart"></b><small data-t="autostart_note"></small></div><label class="switch"><input type="checkbox" id="autostart"><i></i></label></div>
+      <div class="row"><div><b data-t="ui_lang"></b></div><select id="ui_lang"><option value="ja">日本語</option><option value="en">English</option></select></div>
+    </div>
+  </section>
+
+  <section id="about">
+    <h1 data-t="nav_about"></h1>
+    <div class="card">
+      <div class="row"><div><b>screen-translate</b><small id="version"></small></div></div>
+      <div class="row"><div><b>Built with PLaMo</b><small data-t="license_note"></small></div><a id="license" data-t="license_link"></a></div>
+      <div class="row"><div><b data-t="folder"></b><small id="folder" style="user-select:text;word-break:break-all"></small></div></div>
+    </div>
+  </section>
+</main>
+
+<div id="intro">
+  <div class="panel">
+    <div class="step" data-step="0">
+      <h1 data-t="hello"></h1>
+      <p data-t="hello_note"></p>
+      <button class="choice" data-lang="ja"><span>日本語</span></button>
+      <button class="choice" data-lang="en"><span>English</span></button>
+      <div class="foot"><span class="steps">1 / 3</span><button class="btn main" data-next data-t="next"></button></div>
+    </div>
+    <div class="step" data-step="1">
+      <h1 data-t="pick_model"></h1>
+      <p data-t="pick_model_note"></p>
+      <div id="intro_models"></div>
+      <div class="bar" id="intro_bar"><i></i></div>
+      <p id="intro_status" style="margin:6px 2px 0"></p>
+      <p class="hint" style="margin-top:10px"><span data-t="license_short"></span> <a id="intro_license" data-t="license_link"></a></p>
+      <div class="foot"><span class="steps">2 / 3</span>
+        <span><button class="btn" data-skip data-t="later"></button> <button class="btn main" id="intro_download"></button></span></div>
+    </div>
+    <div class="step" data-step="2">
+      <h1 data-t="how"></h1>
+      <p data-t="how_note"></p>
+      <div class="keys">
+        <kbd id="how0"></kbd><span data-t="how_once"></span>
+        <kbd id="how1"></kbd><span data-t="how_live"></span>
+        <kbd id="how2"></kbd><span data-t="how_clear"></span>
+      </div>
+      <p data-t="how_bar"></p>
+      <div class="foot"><span class="steps">3 / 3</span><button class="btn main" id="intro_done" data-t="start"></button></div>
+    </div>
+  </div>
+</div>
+
+<dialog id="ask">
+  <h2 id="ask_title"></h2>
+  <p id="ask_text" style="white-space:pre-line"></p>
+  <div class="actions"><button class="btn" id="ask_no"></button><button class="btn main" id="ask_yes"></button></div>
+</dialog>
+
+<script>
+const TEXT = {
+  ja: {
+    nav_translate: '翻訳', nav_model: 'モデル', nav_keys: 'ホットキー', nav_look: '表示', nav_run: '動作', nav_about: '情報',
+    source: '翻訳元', source_note: '読み取る文字の種類です', target: '翻訳先',
+    src_auto: '自動（翻訳先の言語は触らない）', src_ja: '日本語も翻訳する', src_ko: '韓国語',
+    tgt_ja: '日本語', tgt_easy: 'やさしい日本語', tgt_en: '英語', tgt_ko: '韓国語', tgt_hans: '中国語（簡体字）', tgt_hant: '中国語（繁体字）',
+    easy_note: '翻訳先を「やさしい日本語」にすると、外国語をやさしい日本語に訳します。画面の日本語もやさしくしたいときは、翻訳元を「日本語も翻訳する」にします。範囲を選ぶときの上のバーでも切り替えられます。',
+    model: '翻訳モデル', download: 'ダウンロード', cancel: '中止', delete: '削除', load: '読み込む', unload: 'アンロード',
+    st_verify: 'ダウンロードしたファイルを確認しています', st_down: 'ダウンロード中', st_part: '途中までダウンロードしてあります（続きから再開できます）',
+    st_none: 'ダウンロードされていません', st_ready: '読み込み済み（すぐ翻訳できます）', st_loading: '読み込み中…', st_idle: '読み込まれていません（最初の翻訳のときに読み込みます）',
+    model_note: 'GGUF ファイルをモデルのフォルダに置くと一覧に出ます。',
+    key_once: '範囲を 1 回翻訳', key_live: 'リアルタイム翻訳', key_clear: '訳文を消す', key_wait: 'キーを押してください…',
+    key_note: 'Ctrl か Alt を含む組み合わせを押します。Esc で取り消せます。', key_bad: 'Ctrl か Alt を含めてください',
+    show_frame: '翻訳している範囲に緑の枠線を表示する', show_frame_note: '選んだ範囲か窓の外側に細い線を出します', flash_frame: '翻訳が終わったら枠線を一瞬表示する',
+    device: '実行方法', dev_auto: '自動（GPU に載る分を GPU で）', dev_gpu: 'GPU のみ', dev_cpu: 'CPU のみ', gpu_limit: 'GPU メモリ上限', no_limit: '制限なし', threads: 'CPU スレッド数', auto: '自動',
+    autostart: 'Windows の起動時に開始する', autostart_note: 'アプリのフォルダを移動したら入れ直してください', ui_lang: '表示の言語',
+    license_note: 'PLaMo コミュニティライセンスで提供されています', license_link: 'ライセンスを読む', folder: '設定とモデルの保存先',
+    hello: 'ようこそ', hello_note: '画面の文字を、その場で訳文に置き換えます。翻訳はこの PC の中で完結します。表示の言語を選んでください。',
+    next: '次へ', pick_model: '翻訳モデルを選ぶ', pick_model_note: 'あとから変えられます。迷ったら 2B を選んでください。', later: 'あとで',
+    license_short: 'ダウンロードして使うと PLaMo コミュニティライセンスに同意したことになります。組織内の利用には PFN への事前登録が必要です。',
+    agree_download: '同意してダウンロード', how: '使い方', how_note: 'キーを押して、翻訳したい範囲をドラッグします。クリックすると窓全体を選びます。',
+    how_once: '範囲を 1 回翻訳', how_live: '画面が変わるたびに翻訳', how_clear: '訳文を消す', how_bar: '範囲を選ぶときに画面の上にバーが出て、言語とリアルタイムを切り替えられます。', start: 'はじめる',
+    ask_license: 'モデルのライセンス', ask_license_text: 'PLaMo 3 Translate は PLaMo コミュニティライセンスで提供されています。ダウンロードして使うと、この契約に同意したことになります。\n\n組織内での利用を含む商業目的の利用には、PFN への事前登録が必要です。',
+    agree: '同意してダウンロード', back: 'やめる', ask_delete: 'モデルの削除', del_again: 'もう一度使うには、ダウンロードし直す必要があります。', del_gone: 'このファイルはごみ箱に入らず、元に戻せません。', del_yes: '削除する', ask_delete_q: 'を削除しますか？'
+  },
+  en: {
+    nav_translate: 'Translation', nav_model: 'Model', nav_keys: 'Hotkeys', nav_look: 'Appearance', nav_run: 'System', nav_about: 'About',
+    source: 'Translate from', source_note: 'The kind of text to read', target: 'Translate into',
+    src_auto: 'Automatic (leave the target language alone)', src_ja: 'Japanese too', src_ko: 'Korean',
+    tgt_ja: 'Japanese', tgt_easy: 'Easy Japanese', tgt_en: 'English', tgt_ko: 'Korean', tgt_hans: 'Chinese (Simplified)', tgt_hant: 'Chinese (Traditional)',
+    easy_note: 'Easy Japanese turns foreign text into plain Japanese. To simplify the Japanese on screen as well, set the source to "Japanese too". The bar shown while selecting a region switches these too.',
+    model: 'Translation model', download: 'Download', cancel: 'Cancel', delete: 'Delete', load: 'Load', unload: 'Unload',
+    st_verify: 'Checking the downloaded file', st_down: 'Downloading', st_part: 'Partly downloaded (it can resume)',
+    st_none: 'Not downloaded', st_ready: 'Loaded and ready', st_loading: 'Loading…', st_idle: 'Not loaded (loads with the first translation)',
+    model_note: 'GGUF files placed in the model folder appear in this list.',
+    key_once: 'Translate a region once', key_live: 'Live translation', key_clear: 'Clear the translation', key_wait: 'Press the keys…',
+    key_note: 'Press a combination with Ctrl or Alt. Esc cancels.', key_bad: 'Include Ctrl or Alt',
+    show_frame: 'Show a green frame around the region', show_frame_note: 'A thin line just outside the region or window', flash_frame: 'Flash the frame when a translation finishes',
+    device: 'Run on', dev_auto: 'Automatic (GPU for what fits)', dev_gpu: 'GPU only', dev_cpu: 'CPU only', gpu_limit: 'GPU memory limit', no_limit: 'No limit', threads: 'CPU threads', auto: 'Automatic',
+    autostart: 'Start with Windows', autostart_note: 'Turn this on again after moving the app folder', ui_lang: 'Language',
+    license_note: 'Provided under the PLaMo Community License', license_link: 'Read the license', folder: 'Settings and models are stored in',
+    hello: 'Welcome', hello_note: 'Replaces the text on your screen with its translation, right where it is. Translation stays on this PC. Choose your language.',
+    next: 'Next', pick_model: 'Choose a translation model', pick_model_note: 'You can change it later. If unsure, take 2B.', later: 'Later',
+    license_short: 'Downloading and using it means accepting the PLaMo Community License. Use within an organization requires registering with PFN first.',
+    agree_download: 'Accept and download', how: 'How to use it', how_note: 'Press the keys, then drag over the area to translate. A click selects a whole window.',
+    how_once: 'Translate a region once', how_live: 'Translate whenever the screen changes', how_clear: 'Clear the translation', how_bar: 'A bar at the top of the screen, shown while selecting, switches languages and live mode.', start: 'Get started',
+    ask_license: 'Model license', ask_license_text: 'PLaMo 3 Translate is provided under the PLaMo Community License. Downloading and using it means accepting that agreement.\n\nCommercial use, including use within an organization, requires registering with PFN first.',
+    agree: 'Accept and download', back: 'Cancel', ask_delete: 'Delete model', del_again: 'To use it again you will need to download it again.', del_gone: 'This file skips the Recycle Bin and cannot be restored.', del_yes: 'Delete', ask_delete_q: ': delete this file?'
+  }
+};
+const LICENSE = { ja: 'https://plamo.preferredai.jp/info/plamo-community-license-ja', en: 'https://plamo.preferredai.jp/info/plamo-community-license-en' };
+const GPU_LIMITS = [null, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192];
+const $ = id => document.getElementById(id);
+const post = m => chrome.webview.postMessage(m);
+let state = null, page = 'translate', waiting = -1, step = 0, introOpen = false, pending = null;
+const T = key => TEXT[state?.ui_lang === 'en' ? 'en' : 'ja'][key] ?? key;
+
+function options(select, list, value) {
+  const wanted = list.map(o => o[0] + '\u0000' + o[1]).join('\u0001');
+  if (select.dataset.list !== wanted) {
+    select.textContent = '';
+    for (const [v, label] of list) { const o = new Option(label, v); select.add(o); }
+    select.dataset.list = wanted;
+  }
+  if (document.activeElement !== select || select.dataset.sent === String(value)) select.value = String(value);
+}
+function show(id) {
+  page = id;
+  for (const s of document.querySelectorAll('section')) s.classList.toggle('on', s.id === id);
+  for (const b of document.querySelectorAll('nav button')) b.setAttribute('aria-current', b.dataset.go === id);
+}
+function keyName(v) {
+  if (v >= 0x41 && v <= 0x5A || v >= 0x30 && v <= 0x39) return String.fromCharCode(v);
+  if (v >= 0x70 && v <= 0x87) return 'F' + (v - 0x6F);
+  if (v >= 0x60 && v <= 0x69) return 'Num ' + (v - 0x60);
+  return { 0x20: 'Space', 0x09: 'Tab', 0x0D: 'Enter', 0x08: 'Backspace', 0x2D: 'Insert', 0x2E: 'Delete', 0x24: 'Home', 0x23: 'End', 0x21: 'PageUp', 0x22: 'PageDown',
+    0x25: '←', 0x26: '↑', 0x27: '→', 0x28: '↓', 0xBA: ':', 0xBB: ';', 0xBC: ',', 0xBD: '-', 0xBE: '.', 0xBF: '/', 0xC0: '@', 0xDB: '[', 0xDC: '¥', 0xDD: ']', 0xDE: '^', 0xE2: '\\' }[v] ?? 'VK ' + v.toString(16);
+}
+const hotkey = h => [h.mods & 2 && 'Ctrl', h.mods & 1 && 'Alt', h.mods & 4 && 'Shift', keyName(h.key)].filter(Boolean).join(' + ');
+function statusOf(s) {
+  const m = s.models.find(x => x.file === s.model);
+  if (!m) return '';
+  if (s.progress === 100) return T('st_verify');
+  if (s.progress >= 0) return T('st_down') + ' ' + s.progress + '%';
+  if (!m.present && m.partial) return T('st_part');
+  if (!m.present) return T('st_none');
+  return T(s.engine === 'ready' ? 'st_ready' : s.engine === 'loading' ? 'st_loading' : 'st_idle');
+}
+function bar(el, s) { el.style.display = s.progress >= 0 ? 'block' : 'none'; el.firstElementChild.style.width = Math.max(s.progress, 0) + '%'; }
+
+function render(s) {
+  state = s;
+  document.documentElement.lang = s.ui_lang;
+  document.title = s.title;
+  for (const el of document.querySelectorAll('[data-t]')) el.textContent = T(el.dataset.t);
+  options($('source'), [['auto', T('src_auto')], ['ja', T('src_ja')], ['ko', T('src_ko')]], s.source);
+  options($('target'), [['ja', T('tgt_ja')], ['ja(easy)', T('tgt_easy')], ['en', T('tgt_en')], ['ko', T('tgt_ko')], ['zh-hans', T('tgt_hans')], ['zh-hant', T('tgt_hant')]], s.target);
+  options($('models'), s.models.map(m => [m.file, m.label]), s.model);
+  options($('device'), [['auto', T('dev_auto')], ['gpu', T('dev_gpu')], ['cpu', T('dev_cpu')]], s.device);
+  options($('gpu_limit'), GPU_LIMITS.map(v => [v ?? '', v === null ? T('no_limit') : (v / 1024) + ' GB']), s.gpu_limit ?? '');
+  const threads = [['', T('auto') + ' (' + s.cpu_auto + ')']];
+  for (let n = 1; n <= s.cpu_max; n++) threads.push([n, String(n)]);
+  options($('threads'), threads, s.threads ?? '');
+  $('gpu_limit').disabled = s.device !== 'auto';
+  $('ui_lang').value = s.ui_lang;
+  for (const id of ['show_frame', 'flash_frame', 'autostart']) $(id).checked = s[id];
+  for (const b of document.querySelectorAll('[data-key]')) {
+    const i = +b.dataset.key;
+    b.classList.toggle('wait', i === waiting);
+    b.textContent = i === waiting ? T('key_wait') : hotkey(s.hotkeys[i]);
+  }
+  const m = s.models.find(x => x.file === s.model) ?? {};
+  const downloading = s.progress >= 0;
+  $('status').textContent = statusOf(s);
+  bar($('bar'), s);
+  $('download').textContent = T(downloading ? 'cancel' : 'download');
+  $('download').disabled = !((downloading && s.progress !== 100) || (!downloading && !m.present && m.download));
+  $('delete').disabled = !((m.present || m.partial) && !downloading);
+  $('load').disabled = !(m.present && !downloading && s.engine === 'unloaded');
+  $('unload').disabled = s.engine === 'unloaded';
+  $('message').hidden = !s.message;
+  $('message').textContent = s.message;
+  $('version').textContent = s.version;
+  $('folder').textContent = s.folder;
+  if (!introOpen && s.intro) { introOpen = true; $('intro').classList.add('on'); }
+  renderIntro(s, m, downloading);
+}
+function renderIntro(s, m, downloading) {
+  if (!introOpen) return;
+  for (const el of document.querySelectorAll('.step')) el.classList.toggle('on', +el.dataset.step === step);
+  for (const b of document.querySelectorAll('[data-lang]')) b.setAttribute('aria-pressed', b.dataset.lang === s.ui_lang);
+  const box = $('intro_models');
+  const entries = s.models.filter(x => x.download);
+  if (box.dataset.lang !== s.ui_lang) {
+    box.textContent = ''; box.dataset.lang = s.ui_lang;
+    for (const e of entries) {
+      const b = document.createElement('button');
+      b.className = 'choice'; b.dataset.file = e.file;
+      const [name, note] = e.label.replace(')', '').split(' (');
+      b.innerHTML = '<span></span><small></small>';
+      b.children[0].textContent = name; b.children[1].textContent = note;
+      b.onclick = () => { if (state.progress < 0) send('model', e.file); };
+      box.append(b);
+    }
+  }
+  for (const b of box.children) b.setAttribute('aria-pressed', b.dataset.file === s.model);
+  bar($('intro_bar'), s);
+  $('intro_status').textContent = m.present || downloading ? statusOf(s) : '';
+  const d = $('intro_download');
+  d.textContent = m.present ? T('next') : downloading ? T('cancel') : T('agree_download');
+  d.disabled = downloading && s.progress === 100;
+  for (const i of [0, 1, 2]) $('how' + i).textContent = hotkey(s.hotkeys[i]);
+}
+function send(cmd, value) { post({ cmd, value }); }
+function ask(title, text, yes, then) {
+  $('ask_title').textContent = title; $('ask_text').textContent = text;
+  $('ask_yes').textContent = yes; $('ask_no').textContent = T('back');
+  pending = then; $('ask').showModal();
+}
+$('ask_yes').onclick = () => { $('ask').close(); pending?.(); };
+$('ask_no').onclick = () => $('ask').close();
+for (const b of document.querySelectorAll('nav button')) b.onclick = () => show(b.dataset.go);
+for (const id of ['source', 'target', 'device']) $(id).onchange = e => { e.target.dataset.sent = e.target.value; send(id, e.target.value); };
+$('models').onchange = e => { e.target.dataset.sent = e.target.value; send('model', e.target.value); };
+$('ui_lang').onchange = e => send('ui_lang', e.target.value);
+$('gpu_limit').onchange = e => { e.target.dataset.sent = e.target.value; send('gpu_limit', e.target.value === '' ? null : +e.target.value); };
+$('threads').onchange = e => { e.target.dataset.sent = e.target.value; send('threads', e.target.value === '' ? null : +e.target.value); };
+for (const id of ['show_frame', 'flash_frame', 'autostart']) $(id).onchange = e => send(id, e.target.checked);
+$('download').onclick = () => {
+  if (state.progress >= 0) return send('cancel');
+  ask(T('ask_license'), T('ask_license_text'), T('agree'), () => send('download'));
+};
+$('delete').onclick = () => {
+  const m = state.models.find(x => x.file === state.model);
+  ask(T('ask_delete'), m.file + ' ' + T('ask_delete_q') + '\n' + T(m.download ? 'del_again' : 'del_gone'), T('del_yes'), () => send('delete'));
+};
+$('load').onclick = () => send('load');
+$('unload').onclick = () => send('unload');
+for (const a of [$('license'), $('intro_license')]) a.onclick = () => send('open', LICENSE[state.ui_lang] ?? LICENSE.ja);
+for (const b of document.querySelectorAll('[data-key]')) b.onclick = () => { waiting = +b.dataset.key; render(state); };
+addEventListener('keydown', e => {
+  if (waiting < 0) return;
+  e.preventDefault();
+  if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) return;
+  const index = waiting;
+  waiting = -1;
+  if (e.key === 'Escape') return render(state);
+  if (!e.ctrlKey && !e.altKey) { state.message = T('key_bad'); return render(state); }
+  post({ cmd: 'hotkey', index, mods: (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 4 : 0), key: e.keyCode });
+}, true);
+addEventListener('keyup', e => { if (waiting >= 0) e.preventDefault(); }, true);
+for (const b of document.querySelectorAll('[data-lang]')) b.onclick = () => send('ui_lang', b.dataset.lang);
+function go(n) { step = n; renderIntro(state, state.models.find(x => x.file === state.model) ?? {}, state.progress >= 0); }
+for (const b of document.querySelectorAll('[data-next]')) b.onclick = () => go(step + 1);
+for (const b of document.querySelectorAll('[data-skip]')) b.onclick = () => go(2);
+$('intro_download').onclick = () => {
+  const m = state.models.find(x => x.file === state.model) ?? {};
+  if (m.present) return go(2);
+  send(state.progress >= 0 ? 'cancel' : 'download');
+};
+$('intro_done').onclick = () => { introOpen = false; $('intro').classList.remove('on'); send('intro_done'); };
+chrome.webview.addEventListener('message', e => render(e.data));
+show(page);
+post({ cmd: 'ready' });
+</script>
+</body>
+</html>
