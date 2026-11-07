@@ -2,157 +2,159 @@
 
 [日本語](README.md) | **English**
 
-A tray app for Windows that reads any part of your screen and replaces the text with its translation, right where it is, the way Google Translate does with images. It translates into Japanese, easy Japanese, English, Korean and Chinese. Everything runs on your PC; nothing you translate leaves it.
+This English version was translated from the Japanese README by PLaMo 3 Translate 2B, the model this app uses, and then corrected where it was wrong.
+
+This is a tray app for Windows. It performs OCR on any area of the screen, replacing text with translations. You can choose from Japanese, easy Japanese, English, Korean, or Chinese as the target. Like Google Translate's image translation, it overlays the translation on top of the original text. All processing is completed entirely on your PC.
 
 Built with PLaMo.
 
 ## Getting started
 
-Windows 11 is required. There is nothing to install, and the Visual C++ runtime comes in the zip. Unpack the zip anywhere and run `screen-translate.exe`. A short guide opens the first time, where you choose a language and a translation model.
+The supported OS is Windows 11. No installation is required. The Visual C++ runtime is included in the zip file, so it works without installing it separately. Extract the zip file to your preferred folder and launch `screen-translate.exe`. The first time you run it, a prompt will appear asking you to select the display language and translation model.
 
-Settings and models are kept in the `data` folder next to the exe, so deleting the folder removes the app. To update, unpack a new zip over the old one. If the folder is not writable, as in Program Files, the app uses a `screen-translate` folder in `%APPDATA%` and `%LOCALAPPDATA%` instead. If you use autostart, turn it off in the settings before deleting the folder.
+Settings and models are saved in the `data` folder next to the exe. Deleting the entire folder will also delete the app. To update, overwrite the folder with the contents of a new zip file. If you place the app in a location it cannot write to, such as Program Files, they are saved in the `screen-translate` folders in `%APPDATA%` and `%LOCALAPPDATA%`. If you are using auto-start, disable this in the settings before deleting the folder.
 
-Because it is a downloaded file, SmartScreen may warn you the first time you run it. Choose "More info" and then "Run anyway", or tick "Unblock" in the zip's properties before unpacking. On a PC with Smart App Control turned on, you need to do the latter.
+Since this is a downloaded file, you may encounter a SmartScreen warning upon the first launch. Select "Run anyway" under "More info," or check "Unblock" in the zip properties before extracting. On PCs where Smart App Control is enabled, this step is required before extraction.
 
-## Usage
+## How to Use
 
 | Key | Action |
 | --- | --- |
-| Ctrl+Alt+T | Select a region and translate it once |
-| Ctrl+Alt+R | Select a region and keep translating it live. Stop with Ctrl+Alt+X, or by pressing this key twice |
-| Ctrl+Alt+X | Stop and clear the translation |
-| Ctrl+Alt+Q | Show the original while held |
-| Ctrl+Alt+C | Copy the translation to the clipboard. The result appears next to the cursor |
+| Ctrl+Alt+T | Select a region and translate once. |
+| Ctrl+Alt+R | Select a region and continue translating in real time. To stop, press Ctrl+Alt+X or press it twice in succession. |
+| Ctrl+Alt+X | Stop translating and delete the translation |
+| Ctrl+Alt+Q | View the original only while pressing |
+| Ctrl+Alt+C | Copy the translation to the clipboard. The result appears next to the cursor. |
 
-You can change the keys in the settings, assign the middle and side mouse buttons, reset each key to its default, or disable it. Hotkeys keep working while the settings window is open, except while you are choosing a key.
+You can change the keys in the settings. The middle and side mouse buttons can also be assigned. Each key can be reverted to its default or disabled. Hotkeys are only disabled while a key is selected in the settings screen.
 
-Drag to select a region; a green line shows around it as you drag. Click without dragging to select the whole window under the white outline. Esc or a right click cancels, and any translation already running carries on.
+Select a region by dragging. While dragging, a green line appears outside the region. Clicking without dragging selects the entire window within a white frame. You can undo the selection by pressing Esc or right-clicking. Once undone, the previous translation will continue.
 
-While you select, a bar at the top of the screen switches the source, the target, and live mode on or off.
+While selecting a region, a bar appears at the top of the screen. You can toggle the source, target, and live settings on or off here.
 
-To add a region, press Ctrl+Alt+T or Ctrl+Alt+R again during a translation and drag with Shift held. This lets you translate separate places at once, such as subtitles and a chat window. Without Shift, the new region replaces what was running.
+While translating, press Ctrl+Alt+T or Ctrl+Alt+R again, then drag while holding Shift to add a region. You can simultaneously translate distant areas, such as subtitles and the chat field. If you don't hold Shift, the current translation will stop and be replaced by the new region.
 
-Each region keeps the mode it was selected in: live if the bar's live switch was on, one-shot if it was off. When the page under a one-shot region changes, only that region's translation goes away. Translations do not follow a moving window when there are several regions.
+Each region operates in the mode selected for that selection. When "live" is on in the bar, the selected region is translated in real time; when off, the selected region is translated as a one-shot translation. For one-shot translations, only the translation for that specific region disappears when the page changes. When multiple regions are selected, they will not move with the window.
 
-"Pause" in the tray menu stops the hotkeys and all translation, which helps when they clash with the keys of a game. Live translation picks up again when you resume.
+You can stop both the hotkey and translation using "Pause" from the system tray's right-click menu. Use this when it conflicts with game keys. Live translation will resume from where it left off once restarted.
 
-Pressing the same hotkey again on the selection screen translates the previous region again. After turning a page, that makes retranslating a matter of pressing Ctrl+Alt+T twice.
+Press the same hotkey again on the region selection screen to translate the same region as before. To re-translate after turning a page, simply press Ctrl+Alt+T twice.
 
-The translation is laid over the original paragraph by paragraph, matching its size, background, color and weight. If it runs long, a single line spreads into the empty space to its right, and the text shrinks only if that is not enough. Icons, input borders, images and everything else that is not text stay visible. On a photo or gradient, a one-shot translation paints out just the letters and draws outlined text on top; a live translation uses a solid box, because the background keeps moving. Numbers, code and anything else that would come out the same are left alone.
+Translations are overlaid on top of the original text, paragraph by paragraph, with font size, background color, text color, and boldness matched to the original. When the translation is long, if it spans one line, it expands into the empty space on the right; if that is still insufficient, the text is reduced in size. Non-text elements, such as icons, input field borders, and images, remain visible. For text over photos or gradients, in a one-shot translation, only the text is erased with the surrounding color, and the translated text is overlaid with a border. In live mode, since the background moves, these are covered by a solid-colored square. Elements whose translation does not change, such as numbers or code, are not replaced.
 
-A selected region is tied to the window under it. The translation moves with the window, is redone when the window is resized, and hides when it is minimized. A one-shot translation disappears on its own when the screen under it changes substantially.
+The selected region is linked to the window below it. Moving the window moves the translation along; resizing it retranslates; and minimizing it hides it. For one-shot translations, the text automatically disappears when the region's screen changes significantly.
 
-The app never takes the keyboard focus, so your active window stays active. Clicks and scrolling pass through the translation to the window below.
+The active window remains unchanged, as neither the selection nor the translation takes keyboard focus. Clicking or scrolling will move through the translation to reach the window below.
 
 ## Settings
 
-Double-click the tray icon to open the settings. The window uses WebView2, which comes with Windows 11.
+Double-click the system tray icon to open Settings. The Settings screen is displayed using WebView2, which comes standard with Windows 11.
 
-- Translate from and into: the same choices as the bar
-- Style: automatic, polite or plain. Automatic follows the tone of the original
-- Glossary: words that must get a fixed translation, used only when the original contains them
-- Read Korean: an extra download that adds Hangul
-- Translation model: choose, download, delete, load, unload
-- Run on: automatic, GPU only, CPU only
-- GPU memory limit: the most GPU memory the engine may use in automatic mode
-- CPU threads: the number of performance cores by default, which you can lower
-- Hotkeys: a key for each of the five actions, each with reset and disable
-- Green frame: a thin line just outside the region, or just inside it for a window that fills the screen. It can also flash when a translation finishes. Both are off by default
-- Translation font, bold and strength: lowering the strength lets the screen show through
-- History: recent translations, with search and copy. Kept in memory only and gone when the app exits. It can be turned off
-- Start with Windows: off by default
-- Language: Japanese or English, following Windows at first
+- Source and target: Same settings as the bar used to select the region
+- Style: Automatic, polite, plain. Auto matches the tone of the original.
+- Glossary: A list of words for which you want a fixed translation. It is used only when the word appears in the original text.
+- Read Korean: Becomes available with an additional download
+- Translation model: Select, download, delete, load, unload
+- Execution Method: Automatic, GPU Only, CPU Only
+- GPU Memory Limit: When set to Automatic, select the maximum GPU memory used by the translation engine.
+- CPU Threads: When set to Auto, the number of performance cores is used. You can reduce this to your preferred number.
+- Hotkeys: Keys for each of the five operations. Each key can be reset or disabled.
+- Green border: Displays a thin line outside the translation region. For full-screen windows, it displays an inner line. You can also display a thick line for a brief moment when translation is complete. Both are disabled by default.
+- Translation font, bold, strength: Lowering the strength makes the original screen visible through.
+- History: A list of recent translations. Search and copy available. Stored only in memory and disappears when the app is closed. Can also be turned off.
+- Autostart: Starts when Windows boots. Disabled by default.
+- Display language: Japanese or English. Set to match Windows language the first time.
 
-The default, automatic, runs what fits in GPU memory on the GPU and the rest on the CPU. With enough free memory everything goes on the GPU, and on a PC without a GPU everything runs on the CPU. If GPU memory is tight, the lighter 0.8B model runs faster.
+The default "Auto" runs the portion in GPU memory on the GPU and the remainder on the CPU. If there is enough free space, everything runs on the GPU; on PCs without a GPU, it runs solely on the CPU. When GPU memory is low, switching to the lighter 0.8B option will make it run faster.
 
-There is no RAM limit. RAM use depends on the size of the model and how much of it is on the GPU, so to reduce it, choose a lighter model or put more on the GPU.
+There is no RAM limit. Since RAM usage is determined by model size and the amount of data loaded onto the GPU, you can reduce usage by choosing a lighter model or increasing the amount of data loaded onto the GPU.
 
-Starting the app a second time opens the settings of the one already running. If the app crashes, the cause is written to `crash.log` in the `data` folder.
+Launching the app again will open the settings for the running instance. If it crashes unexpectedly, the cause is written to the `crash.log` file in the `data` folder.
 
-## Languages
+## Supported Languages
 
-The app reads Latin-script languages (English, French, German, Spanish and so on), Chinese and Japanese. To read Korean, download the OCR model (13 MB) in the settings. After that, Korean is translated automatically like the other languages.
+The system can read Latin-script languages (such as English, French, German, and Spanish), Chinese, and Japanese. For Korean, you can read the text by downloading the OCR model (13MB) from the settings, and it will automatically translate it just like other languages.
 
-Text already in the target language is left alone. With easy Japanese as the target, for example, foreign text becomes easy Japanese and the Japanese on screen stays as written. Setting the source to "Japanese too" rewrites that Japanese into easy Japanese as well. Easy Japanese is a setting the model card does not list (`ja(easy)`), but the model's template and PFN's CLI use it.
+It does not touch characters written in the target language. For example, if the target is "easy Japanese," it translates only the foreign language into easy Japanese, leaving the Japanese text on the screen as is. If the source is set to "Japanese too," the Japanese text on the screen is also rewritten into easy Japanese. Easy Japanese is a specification not found in the model card (`ja(easy)`) and is used by the model template and the PFN CLI.
 
-With English as the target, text in plain Latin letters counts as English and is not translated. Russian, Arabic and Thai cannot be read by the OCR model, so they cannot be translated.
+When the target language is English, sentences containing only Latin characters are treated as English and are not translated. Russian, Arabic, and Thai cannot be translated because the OCR model cannot read them.
 
-## Models
+## Model
 
 | Model | Size | Notes |
 | --- | --- | --- |
-| PLaMo 3 Translate 0.8B | 0.6 GB | Light. About twice as fast as 2B, with more mistranslations |
-| PLaMo 3 Translate 2B | 1.8 GB | Standard |
-| PLaMo 3 Translate 8B | 5.3 GB | High quality |
-| PLaMo 3 Translate 31B | 19.5 GB | Best quality |
+| PLaMo 3 Translate 0.8B | 0.6GB | Lightweight. About twice as fast as 2B, but more mistranslations. |
+| PLaMo 3 Translate 2B | 1.8GB | Standard |
+| PLaMo 3 Translate 8B | 5.3GB | High quality |
+| PLaMo 3 Translate 31B | 19.5GB | Highest Quality |
 
-Other models work too. Put a GGUF file in `data\models` and it appears in the settings. Models whose file name does not start with `plamo-3-translate` are asked to translate through their own chat template.
+Other models can also be used. Placing GGUF files in `data\models` will make them appear in the settings list. Models whose filenames do not start with `plamo-3-translate` are asked to translate through their own chat template.
 
-A cancelled download keeps its partial file, and the next download resumes from it. "Delete" removes it if you no longer want it.
+If you cancel the download, files left unfinished will be retained, and the next download will pick up from where they left off. If you no longer need them, you can delete them using "Delete."
 
 ## Measurements
 
-These are from a PC with an RTX 4070 Ti and a Core i7-13700F, running PLaMo 3 Translate 2B on the GPU.
+These are the values when running PLaMo 3 Translate 2B on the GPU of an RTX 4070 Ti and Core i7-13700F PC.
 
 | Item | Value |
 | --- | --- |
-| One sentence, from selecting the region to the translation showing | 0.1 to 0.3 s |
-| Live update, from the text changing to the translation showing | About 0.2 s |
-| From the screen changing to the old translation going away | About 0.04 s |
-| A 2000×1077 settings screen with about 40 paragraphs | About 1 s to the first result, about 2 s in all |
-| First translation after starting the app | About 3 s |
-| App memory, idle | 9 MB |
-| App memory, working | About 90 MB |
-| Engine memory, model loaded | About 380 MB |
-| GPU memory, model loaded | About 2.1 GB |
+| Translation of 1 sentence (from defining the region to displaying it) | 0.1–0.3 s |
+| Live updates (from the moment text changes until it is displayed) | about 0.2 seconds |
+| From the moment the screen changes until the old translation disappears | about 0.04 seconds |
+| 2000×1077 settings screen, approx. 40 paragraphs | About 1 second for the first display, about 2 seconds in total |
+| First translation after launching the app | about 3 seconds |
+| App memory (idle) | 9MB |
+| App memory (running) | Approx. 90MB |
+| Translation engine memory (model loaded) | Approx. 380MB |
+| GPU memory (model loaded) | Approx. 2.1 GB |
 
-The OCR models leave memory after 60 seconds without use, and the engine stops after 15 minutes. Unloading stops the engine, which frees all of its memory, on the GPU as well.
+The OCR model is unloaded after 60 seconds without use, and the translation engine is stopped after 15 minutes without use. Since unloading means stopping the engine, both the memory and GPU memory are completely freed up.
 
-Run modes and engines compare as follows, translating 10 paragraphs with 4 requests at a time.
+The differences between the execution method and the engine are as follows (translation of 10 paragraphs, 4 simultaneous).
 
 | Setup | Time | RAM | GPU memory |
 | --- | --- | --- | --- |
-| Automatic (default; all on the GPU on this PC) | 0.68 s | 360 MB | 2.15 GB |
-| Automatic, GPU memory limit 1.5 GB | 3.8 s | 1.0 GB | 1.5 GB |
-| Automatic, GPU memory limit 1 GB | 6.4 s | 1.5 GB | 1.0 GB |
-| CPU only (8 threads) | 7.5 s | 2.2 GB | 0 |
-| For reference: llama-server + CUDA | 0.6 s | 650 MB | 2.35 GB |
-| For reference: Ollama (CUDA) | 0.66 s | 1.5 GB | 2.3 GB |
+| Automatic (Default, all GPU on this PC) | 0.68 seconds | 360MB | 2.15GB |
+| Automatic, GPU memory limit 1.5GB | 3.8 seconds | 1.0GB | 1.5GB |
+| Automatic, GPU memory limit 1GB | 6.4 seconds | 1.5GB | 1.0GB |
+| CPU only (8 threads) | 7.5 seconds | 2.2GB | 0 |
+| Reference: llama-server + CUDA | 0.6 seconds | 650MB | 2.35GB |
+| Reference: Ollama (CUDA) | 0.66 seconds | 1.5GB | 2.3GB |
 
-The more layers go to the CPU, the slower it gets, so use the GPU memory limit only when you are short of memory. A limit also adds about 3 seconds to loading, to work out the split.
+The more layers you pass to the CPU, the slower it becomes, so use the GPU memory limit only when memory is short. Setting a limit also extends the loading time by about 3 seconds to account for the allocation calculation.
 
-## How it works
+## How It Works
 
-- The screen is captured with GDI's BitBlt. A separate thread looks at it every 0.033 seconds and passes any change to OCR. It keeps watching during OCR, so stale translations go away at once.
-- OCR is PP-OCRv6 small, run on the CPU by rten, with the models embedded in the exe. If the Korean model is installed, lines the main model is unsure of are read by it too, and the result is used if it is Hangul. The thread count follows the PC's performance cores. The ink in each detected box is examined row by row to find the extent of the text, its background and text colors, and its weight.
-- Translation starts llama-server and talks to it over HTTP. Paragraphs are grouped into about 240 characters, one paragraph per line, sent 4 at a time, and shown line by line as they arrive. Paragraphs in a group give each other context, and the group before is passed along as reference.
-- Window moves arrive through WinEvent, and the translation moves without any OCR.
-- The overlay is a topmost window with a see-through color.
+- The screen is captured using GDI's BitBlt. A separate thread scans the screen every 0.033 seconds and passes any changes to OCR. Since it can detect changes even during OCR, old translations are quickly cleared.
+- OCR is executed on the CPU using PP-OCRv6 small via rten. The model is embedded in the exe. If the Korean model has been downloaded, only lines where reading confidence is low are also read using the PP-OCRv5 Korean model; if the text is in Hangul, that model is used instead. The number of threads is adjusted to match the number of performance cores on the PC. The ink within the detection frame is examined line by line to determine the character-only region, background color, text color, and boldness.
+- Translation is requested via HTTP by launching llama-server. Paragraphs are grouped into about 240 characters, one paragraph per line, sent four at a time, and displayed as each line is completed. The grouped paragraphs form the context, and the original text of the preceding group is also provided for reference.
+- Window movement is detected via WinEvent, and the translation is moved without performing OCR.
+- The overlay is the frontmost window with a transparent color.
 
-## Limitations
+## Limits
 
-- Live translations do not appear in screenshots or recordings, so that OCR never reads its own output. One-shot translations do, though once in a while one will not. With several regions, one-shot regions behave like live ones in this respect.
-- In live mode, text on a photo or gradient is covered by a solid box.
-- Vertical and rotated text cannot be read.
-- Regions with a long side over 1,600 pixels are scaled down before reading, which makes small text harder to read. Several regions count as the area around them all, so regions far apart are affected too.
-- A one-shot translation goes away when 8% or more of the region's pixels change, so a small scroll may leave it up. Use live mode to follow the screen.
-- Games in exclusive fullscreen and copy-protected video are not supported.
+- Live translations will not appear in screenshots or recordings. This is to prevent OCR from reading its own translations. One-shot translations will appear, though they may occasionally fail to do so. When multiple regions are selected, the one-shot translation region will also not appear.
+- In live mode, text over photos or gradients is covered by a solid-colored square.
+- Vertically written and rotated text cannot be read.
+- Regions where the long side exceeds 1,600 pixels are scaled down before being read, making small characters harder to read. When there are multiple regions, the size is calculated by enclosing all of them, so distant regions are treated the same.
+- In one-shot translations, the text disappears if 8% or more of the pixels change. It may remain with slight scrolling. Use live mode to make it follow the screen.
+- Exclusive full-screen games and copy-protected videos are not supported.
 
-## Building
+## Build
 
-You need Rust (MSVC).
+Rust (MSVC) is required.
 
 ```bash
 cargo build --release
 ```
 
-The engine is looked for at `engine\llama-server.exe` next to the exe, then inside an Ollama installation. To make the release zip, run the following. It fetches the official llama.cpp build (Vulkan) and packages it with the app.
+The app looks for the translation engine at `engine\llama-server.exe` next to the exe file; if it's not found, it uses the one bundled with Ollama. The following command creates the distribution zip. It retrieves and includes the official build (Vulkan version) of llama.cpp.
 
 ```bash
 powershell -ExecutionPolicy Bypass -File scripts/package.ps1
 ```
 
-To check how the overlay looks without touching the screen, draw it onto an image.
+To check the display without touching the screen, draw the translation on the image and save it.
 
 ```bash
 RENDER_IN=in.png RENDER_OUT=out.png cargo test render_picture -- --ignored --nocapture
@@ -160,6 +162,6 @@ RENDER_IN=in.png RENDER_OUT=out.png cargo test render_picture -- --ignored --noc
 
 ## License
 
-The app's source code is under the MIT License. [NOTICE.md](NOTICE.md) covers what is bundled and the models, and the full texts are in the `licenses` folder.
+The source code for this app is licensed under the MIT License. The licenses for the bundled materials and models are summarized in [NOTICE.md](NOTICE.md). The full texts are in the `licenses` folder.
 
-PLaMo 3 Translate is provided under the [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-en). The model is in neither this repository nor the releases; downloading it from the settings means you accept that license. **If you want to use this at work, read the [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-en).** Business use on a work PC counts as commercial use, whether or not it runs locally. If the most recent fiscal year's revenue, affiliates included, is 1 billion yen or less, you must submit PFN's registration form; above that, you need a separate agreement. If you publish translations, state that they were generated by PLaMo.
+PLaMo 3 Translate is provided under the [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-en), and the model is not included in this repository or the distribution. By downloading it from the settings screen, you agree to this license. **When using this for business purposes, please read the [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-en).** Using it for work on a workplace PC also constitutes a commercial use, regardless of whether it runs locally. If your revenue for the most recent fiscal year (including affiliates) is 1 billion yen or less, you must submit the PFN registration form; if it exceeds 1 billion yen, a separate contract is required. When publishing translation results, please clearly indicate that they are PLaMo-generated.
