@@ -94,19 +94,20 @@ If you cancel the download, files left unfinished will be retained, and the next
 
 ## Measurements
 
-These are the values when running PLaMo 3 Translate 2B on the GPU of an RTX 4070 Ti and Core i7-13700F PC.
+These are the values when running PLaMo 3 Translate 2B on the GPU of an RTX 4070 Ti and Core i7-13700F PC. Values for 0.8B are given only where measured.
 
 | Item | Value |
 | --- | --- |
 | Translation of 1 sentence (from defining the region to displaying it) | 0.1–0.3 s |
-| Live updates (from the moment text changes until it is displayed) | about 0.2 seconds |
+| Live updates (2 lines of subtitles, from text change to display) | Approx. 0.8 s (0.77–0.87 s for 2B, 0.66–0.83 s for 0.8B). Most of it is OCR, at 0.5–0.65 s. |
+| Translating one figure | 2B is about 2 seconds, 0.8B is about 1 second |
 | From the moment the screen changes until the old translation disappears | about 0.04 seconds |
 | 2000×1077 settings screen, approx. 40 paragraphs | About 1 second for the first display, about 2 seconds in total |
 | First translation after launching the app | about 3 seconds |
 | App memory (idle) | 9MB |
 | App memory (running) | Approx. 90MB |
 | Translation engine memory (model loaded) | Approx. 380MB |
-| GPU memory (model loaded) | Approx. 2.1 GB |
+| GPU memory (model loaded) | 2B is about 2.1GB, 0.8B is about 0.65GB |
 
 The OCR model is unloaded after 60 seconds without use, and the translation engine is stopped after 15 minutes without use. Since unloading means stopping the engine, both the memory and GPU memory are completely freed up.
 
