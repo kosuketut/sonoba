@@ -170,7 +170,8 @@ fn state() -> Value {
         "opacity": config.opacity,
         "keep_history": config.keep_history,
         "autostart": autostart(),
-        "intro": !config.intro_done && !models::is_present(&config.model),
+        "intro": !config.license_accepted || (!config.intro_done && !models::is_present(&config.model)),
+        "intro_done": config.intro_done,
     })
 }
 
@@ -310,8 +311,12 @@ fn on_message(text: &str) {
             });
         }
         "intro_done" => config::update(|c| c.intro_done = true),
-        // The licence binds whoever downloads the model; the page asks them first.
-        "download" => models::start_download(config::get().model),
+        "license_accept" => config::update(|c| c.license_accepted = true),
+        "close" => unsafe {
+            DestroyWindow(window());
+        },
+        // The licence binds whoever uses the model, so the guide has them accept it first.
+        "download" if config::get().license_accepted => models::start_download(config::get().model),
         "korean_download" => models::start_download(models::KOREAN_OCR.to_string()),
         "korean_delete" => {
             if let Err(e) = models::delete(models::KOREAN_OCR) {

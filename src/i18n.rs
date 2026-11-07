@@ -11,6 +11,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ("終了", "Exit"),
     ("ダブルクリックで設定を開きます", "Double-click for settings"),
     ("ホットキーを登録できません。別のアプリが使っています。設定で変更してください。", "A hotkey is taken by another app. Change it in the settings."),
+    ("ライセンスに同意するまで翻訳できません", "Translation needs the license accepted first"),
     ("モデルがありません。トレイのアイコンから設定を開いてダウンロードしてください", "No model yet. Open the settings from the tray icon and download one."),
     ("モデルを読み込めません。GPU メモリの不足か、ファイルの破損が考えられます", "The model cannot be loaded. GPU memory may be short, or the file damaged."),
     ("翻訳エンジンに接続できません: ", "Cannot reach the translation engine: "),

@@ -40,6 +40,7 @@ pub struct Config {
     pub target: String, // a language code of the model, "ja(easy)" included
     pub ui_lang: String, // "ja" or "en"
     pub intro_done: bool, // the first-run guide was seen through
+    pub license_accepted: bool, // nothing translates or downloads until the user agrees
     pub form: String, // "" follows the original's tone; "polite" or "plain" for Japanese
     pub glossary: Vec<(String, String)>, // term, and the translation it must get
     pub font: String, // "" for the app's default
@@ -70,6 +71,7 @@ impl Default for Config {
             target: "ja".to_string(),
             ui_lang: system_language().to_string(),
             intro_done: false,
+            license_accepted: false,
             form: String::new(),
             glossary: Vec::new(),
             font: String::new(),
@@ -108,6 +110,7 @@ impl Config {
             config.ui_lang = language.to_string();
         }
         config.intro_done = saved["intro_done"].as_bool().unwrap_or(false);
+        config.license_accepted = saved["license_accepted"].as_bool().unwrap_or(false);
         if let Some(form) = saved["form"].as_str().filter(|f| ["polite", "plain"].contains(f)) {
             config.form = form.to_string();
         }
@@ -145,6 +148,7 @@ impl Config {
             "target": self.target,
             "ui_lang": self.ui_lang,
             "intro_done": self.intro_done,
+            "license_accepted": self.license_accepted,
             "once": hotkey(&self.hotkeys[0]),
             "live": hotkey(&self.hotkeys[1]),
             "clear": hotkey(&self.hotkeys[2]),
@@ -222,6 +226,7 @@ mod tests {
         config.target = "ja(easy)".into();
         config.ui_lang = "en".into();
         config.intro_done = true;
+        config.license_accepted = true;
         config.hotkeys[1] = Hotkey { mods: 6, key: 0x70 };
         config.hotkeys[4] = Hotkey { mods: 0, key: 5 };
         config.hotkeys[3] = Hotkey::OFF;

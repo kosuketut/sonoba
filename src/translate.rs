@@ -64,6 +64,9 @@ impl Translator {
 
     fn ensure_engine(&mut self) -> Result<(), String> {
         let config = config::get();
+        if !config.license_accepted {
+            return Err("ライセンスに同意するまで翻訳できません".to_string());
+        }
         let options = config.engine_options();
         let wanted = (config.model, options);
         if self.engine.as_mut().is_some_and(Engine::is_alive) && self.running.as_ref() == Some(&wanted) {

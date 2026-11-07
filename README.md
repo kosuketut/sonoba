@@ -8,7 +8,7 @@ Built with PLaMo.
 
 ## 導入
 
-対応 OS は Windows 11 です。インストールは要りません。Visual C++ ランタイムは zip に入っているので、別に入れなくても動きます。zip を好きなフォルダに展開して `screen-translate.exe` を起動します。初回は案内が開き、表示の言語と翻訳モデルを選びます。
+対応 OS は Windows 11 です。インストールは要りません。Visual C++ ランタイムは zip に入っているので、別に入れなくても動きます。zip を好きなフォルダに展開して `screen-translate.exe` を起動します。初回は案内が開き、表示の言語を選び、ライセンスに同意し、翻訳モデルを選びます。同意するまで翻訳は使えません。
 
 設定とモデルは exe の隣の `data` フォルダに保存します。フォルダごと消せばアプリも消えます。更新は新しい zip の中身を上書きします。Program Files のように書き込めない場所に置いたときは、`%APPDATA%` と `%LOCALAPPDATA%` の `screen-translate` フォルダに保存します。自動起動を使っているときは、フォルダを消す前に設定でオフにしてください。
 
@@ -162,4 +162,4 @@ RENDER_IN=in.png RENDER_OUT=out.png cargo test render_picture -- --ignored --noc
 
 このアプリのソースコードは MIT License です。同梱物とモデルのライセンスは [NOTICE.md](NOTICE.md) にまとめました。本文は `licenses` フォルダにあります。
 
-PLaMo 3 Translate は [PLaMo コミュニティライセンス](https://plamo.preferredai.jp/info/plamo-community-license-ja) で提供されていて、モデルはこのリポジトリにも配布物にも含みません。設定画面からダウンロードすると、利用者がこのライセンスに同意したことになります。**会社で使うときは、[PLaMo コミュニティライセンス](https://plamo.preferredai.jp/info/plamo-community-license-ja)を読んでください。** 職場の PC で業務に使う場合も商業目的にあたり、ローカルで動くかどうかは関係ありません。直近の事業年度の売上（関係会社を含む）が 10 億円以下なら PFN の登録フォームの提出が必要で、10 億円を超えると別の契約が必要です。翻訳結果を公表するときは、PLaMo の生成物であることを明示してください。
+PLaMo 3 Translate は [PLaMo コミュニティライセンス](https://plamo.preferredai.jp/info/plamo-community-license-ja) で提供されていて、モデルはこのリポジトリにも配布物にも含みません。初回の案内で同意しないと、翻訳もモデルのダウンロードもできません。**会社で使うときは、[PLaMo コミュニティライセンス](https://plamo.preferredai.jp/info/plamo-community-license-ja)を読んでください。** 職場の PC で業務に使う場合も商業目的にあたり、ローカルで動くかどうかは関係ありません。直近の事業年度の売上（関係会社を含む）が 10 億円以下なら PFN の登録フォームの提出が必要で、10 億円を超えると別の契約が必要です。翻訳結果を公表するときは、PLaMo の生成物であることを明示してください。

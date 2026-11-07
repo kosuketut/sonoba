@@ -123,6 +123,10 @@ input[type=text]:focus-visible, input[type=search]:focus-visible { outline: 2px 
 .past:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .past small { color: var(--soft); display: block; }
 .toolbar { display: flex; gap: 8px; margin-bottom: 12px; }
+.points { margin: 0 0 12px; padding-left: 20px; color: var(--text); }
+.points li { margin-bottom: 5px; }
+.agree { display: flex; gap: 9px; align-items: center; padding: 11px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--card); cursor: pointer; }
+.agree input { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
 kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); white-space: nowrap; }
 </style>
 </head>
@@ -242,19 +246,33 @@ kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(
       <p data-t="hello_note"></p>
       <button class="choice" data-lang="ja"><span>日本語</span></button>
       <button class="choice" data-lang="en"><span>English</span></button>
-      <div class="foot"><span class="steps">1 / 3</span><button class="btn main" data-next data-t="next"></button></div>
+      <div class="foot"><span class="steps">1 / 4</span><button class="btn main" data-next data-t="next"></button></div>
     </div>
     <div class="step" data-step="1">
+      <h1 data-t="lic_title"></h1>
+      <p data-t="lic_note"></p>
+      <ul class="points">
+        <li data-t="lic_personal"></li>
+        <li data-t="lic_business"></li>
+        <li data-t="lic_publish"></li>
+        <li data-t="lic_decide"></li>
+        <li data-t="lic_age"></li>
+      </ul>
+      <p><a id="lic_open" data-t="lic_read"></a></p>
+      <label class="agree"><input type="checkbox" id="lic_agree"><span data-t="lic_check"></span></label>
+      <div class="foot"><span class="steps">2 / 4</span>
+        <span><button class="btn" id="lic_no" data-t="lic_decline"></button> <button class="btn main" id="lic_yes" data-t="next" disabled></button></span></div>
+    </div>
+    <div class="step" data-step="2">
       <h1 data-t="pick_model"></h1>
       <p data-t="pick_model_note"></p>
       <div id="intro_models"></div>
       <div class="bar" id="intro_bar"><i></i></div>
       <p id="intro_status" style="margin:6px 2px 0"></p>
-      <p class="hint" style="margin-top:10px"><span data-t="license_short"></span> <a id="intro_license" data-t="license_link"></a></p>
-      <div class="foot"><span class="steps">2 / 3</span>
+      <div class="foot"><span class="steps">3 / 4</span>
         <span><button class="btn" data-skip data-t="later"></button> <button class="btn main" id="intro_download"></button></span></div>
     </div>
-    <div class="step" data-step="2">
+    <div class="step" data-step="3">
       <h1 data-t="how"></h1>
       <p data-t="how_note"></p>
       <div class="keys">
@@ -263,7 +281,7 @@ kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(
         <kbd id="how2"></kbd><span data-t="how_clear"></span>
       </div>
       <p data-t="how_bar"></p>
-      <div class="foot"><span class="steps">3 / 3</span><button class="btn main" id="intro_done" data-t="start"></button></div>
+      <div class="foot"><span class="steps">4 / 4</span><button class="btn main" id="intro_done" data-t="start"></button></div>
     </div>
   </div>
 </div>
@@ -303,11 +321,16 @@ const TEXT = {
     license_note: 'PLaMo コミュニティライセンスで提供されています', license_link: 'ライセンスを読む', folder: '設定とモデルの保存先',
     hello: 'ようこそ', hello_note: '画面の文字を、その場で訳文に置き換えます。翻訳はこの PC の中で完結します。表示の言語を選んでください。',
     next: '次へ', pick_model: '翻訳モデルを選ぶ', pick_model_note: 'あとから変えられます。迷ったら 2B を選んでください。', later: 'あとで',
-    license_short: 'ダウンロードして使うと PLaMo コミュニティライセンスに同意したことになります。組織内の利用には PFN への事前登録が必要です。',
-    agree_download: '同意してダウンロード', how: '使い方', how_note: 'キーを押して、翻訳したい範囲をドラッグします。クリックするとウィンドウ全体を選びます。',
+    lic_title: 'ライセンスへの同意', lic_note: '翻訳モデルの PLaMo 3 Translate は、Preferred Networks（PFN）の PLaMo コミュニティライセンスで提供されています。使うにはこのライセンスへの同意が必要です。主な内容は次のとおりです。',
+    lic_personal: '個人の学習や趣味、学術用途は、登録なしで無料です。',
+    lic_business: '会社の業務など組織内の利用は商業目的にあたります。事前に PFN への登録が必要で、直近の事業年度の売上が関係会社を含めて 10 億円を超えると別の契約が必要です。',
+    lic_publish: '翻訳結果を公表するときは、PLaMo の生成物だと明示してください。',
+    lic_decide: '法律、医療、金融、人物評価などの重要な判断で、翻訳結果を唯一の根拠にしないでください。',
+    lic_age: '18 歳未満の方は、保護者の同意が必要です。',
+    lic_read: 'ライセンスの全文を読む', lic_check: 'ライセンスの全文を読み、同意します', lic_decline: '同意しない',
+    how: '使い方', how_note: 'キーを押して、翻訳したい範囲をドラッグします。クリックするとウィンドウ全体を選びます。',
     how_once: '範囲を 1 回翻訳', how_live: '画面が変わるたびに翻訳', how_clear: '訳文を消す', how_bar: '範囲を選ぶときに画面の上にバーが出て、言語とリアルタイムを切り替えられます。', start: 'はじめる',
-    ask_license: 'モデルのライセンス', ask_license_text: 'PLaMo 3 Translate は PLaMo コミュニティライセンスで提供されています。ダウンロードして使うと、この契約に同意したことになります。\n\n組織内での利用を含む商業目的の利用には、PFN への事前登録が必要です。',
-    agree: '同意してダウンロード', back: 'やめる', ask_delete: 'モデルの削除', del_again: 'もう一度使うには、ダウンロードし直す必要があります。', del_gone: 'このファイルはごみ箱に入らず、元に戻せません。', del_yes: '削除する', ask_delete_q: 'を削除しますか？'
+    back: 'やめる', ask_delete: 'モデルの削除', del_again: 'もう一度使うには、ダウンロードし直す必要があります。', del_gone: 'このファイルはごみ箱に入らず、元に戻せません。', del_yes: '削除する', ask_delete_q: 'を削除しますか？'
   },
   en: {
     nav_translate: 'Translation', nav_model: 'Model', nav_keys: 'Hotkeys', nav_look: 'Appearance', nav_run: 'System', nav_about: 'About',
@@ -336,11 +359,16 @@ const TEXT = {
     license_note: 'Provided under the PLaMo Community License', license_link: 'Read the license', folder: 'Settings and models are stored in',
     hello: 'Welcome', hello_note: 'Replaces the text on your screen with its translation, right where it is. Translation stays on this PC. Choose your language.',
     next: 'Next', pick_model: 'Choose a translation model', pick_model_note: 'You can change it later. If unsure, take 2B.', later: 'Later',
-    license_short: 'Downloading and using it means accepting the PLaMo Community License. Use within an organization requires registering with PFN first.',
-    agree_download: 'Accept and download', how: 'How to use it', how_note: 'Press the keys, then drag over the area to translate. A click selects a whole window.',
+    lic_title: 'License agreement', lic_note: 'The translation model, PLaMo 3 Translate, is provided by Preferred Networks (PFN) under the PLaMo Community License. Using it requires accepting that license. In short:',
+    lic_personal: 'Personal learning, hobbies and academic use are free, with no registration.',
+    lic_business: 'Use within an organization, such as at work, counts as commercial. It requires registering with PFN first, and a separate agreement if the last fiscal year\'s revenue, affiliates included, exceeds 1 billion yen.',
+    lic_publish: 'If you publish translations, state that PLaMo generated them.',
+    lic_decide: 'Do not rely on translations as the only basis for legal, medical, financial or personnel decisions.',
+    lic_age: 'If you are under 18, you need a parent or guardian\'s consent.',
+    lic_read: 'Read the full license', lic_check: 'I have read the full license and accept it', lic_decline: 'Decline',
+    how: 'How to use it', how_note: 'Press the keys, then drag over the area to translate. A click selects a whole window.',
     how_once: 'Translate a region once', how_live: 'Translate whenever the screen changes', how_clear: 'Clear the translation', how_bar: 'A bar at the top of the screen, shown while selecting, switches languages and live mode.', start: 'Get started',
-    ask_license: 'Model license', ask_license_text: 'PLaMo 3 Translate is provided under the PLaMo Community License. Downloading and using it means accepting that agreement.\n\nCommercial use, including use within an organization, requires registering with PFN first.',
-    agree: 'Accept and download', back: 'Cancel', ask_delete: 'Delete model', del_again: 'To use it again you will need to download it again.', del_gone: 'This file skips the Recycle Bin and cannot be restored.', del_yes: 'Delete', ask_delete_q: ': delete this file?'
+    back: 'Cancel', ask_delete: 'Delete model', del_again: 'To use it again you will need to download it again.', del_gone: 'This file skips the Recycle Bin and cannot be restored.', del_yes: 'Delete', ask_delete_q: ': delete this file?'
   }
 };
 const LICENSE = { ja: 'https://plamo.preferredai.jp/info/plamo-community-license-ja', en: 'https://plamo.preferredai.jp/info/plamo-community-license-en' };
@@ -505,7 +533,7 @@ function renderIntro(s, m, downloading) {
   bar($('intro_bar'), s);
   $('intro_status').textContent = m.present || downloading ? statusOf(s) : '';
   const d = $('intro_download');
-  d.textContent = m.present ? T('next') : downloading ? T('cancel') : T('agree_download');
+  d.textContent = m.present ? T('next') : downloading ? T('cancel') : T('download');
   d.disabled = downloading && s.progress === 100;
   for (const i of [0, 1, 2]) $('how' + i).textContent = hotkey(s.hotkeys[i]);
 }
@@ -528,10 +556,7 @@ $('ui_lang').onchange = e => send('ui_lang', e.target.value);
 $('gpu_limit').onchange = e => { e.target.dataset.sent = e.target.value; send('gpu_limit', e.target.value === '' ? null : +e.target.value); };
 $('threads').onchange = e => { e.target.dataset.sent = e.target.value; send('threads', e.target.value === '' ? null : +e.target.value); };
 for (const id of ['show_frame', 'flash_frame', 'autostart', 'bold_text', 'keep_history']) $(id).onchange = e => send(id, e.target.checked);
-$('download').onclick = () => {
-  if (state.progress >= 0) return send('cancel');
-  ask(T('ask_license'), T('ask_license_text'), T('agree'), () => send('download'));
-};
+$('download').onclick = () => send(state.progress >= 0 ? 'cancel' : 'download');
 $('delete').onclick = () => {
   const m = state.models.find(x => x.file === state.model);
   ask(T('ask_delete'), m.file + ' ' + T('ask_delete_q') + '\n' + T(m.download ? 'del_again' : 'del_gone'), T('del_yes'), () => send('delete'));
@@ -540,7 +565,7 @@ $('korean_download').onclick = () => send(state.progress >= 0 ? 'cancel' : 'kore
 $('korean_delete').onclick = () => send('korean_delete');
 $('load').onclick = () => send('load');
 $('unload').onclick = () => send('unload');
-for (const a of [$('license'), $('intro_license'), $('work_license')]) a.onclick = () => send('open', LICENSE[state.ui_lang] ?? LICENSE.ja);
+for (const a of [$('license'), $('lic_open'), $('work_license')]) a.onclick = () => send('open', LICENSE[state.ui_lang] ?? LICENSE.ja);
 function choosing(index) {
   if (waiting >= 0 !== index >= 0) send('capture', index >= 0);
   waiting = index;
@@ -574,10 +599,16 @@ addEventListener('mousedown', e => {
 for (const b of document.querySelectorAll('[data-lang]')) b.onclick = () => send('ui_lang', b.dataset.lang);
 function go(n) { step = n; renderIntro(state, state.models.find(x => x.file === state.model) ?? {}, state.progress >= 0); }
 for (const b of document.querySelectorAll('[data-next]')) b.onclick = () => go(step + 1);
-for (const b of document.querySelectorAll('[data-skip]')) b.onclick = () => go(2);
+for (const b of document.querySelectorAll('[data-skip]')) b.onclick = () => go(3);
+$('lic_agree').onchange = e => { $('lic_yes').disabled = !e.target.checked; };
+$('lic_no').onclick = () => send('close');
+$('lic_yes').onclick = () => {
+  send('license_accept');
+  if (state.intro_done) { introOpen = false; $('intro').classList.remove('on'); } else go(2);
+};
 $('intro_download').onclick = () => {
   const m = state.models.find(x => x.file === state.model) ?? {};
-  if (m.present) return go(2);
+  if (m.present) return go(3);
   send(state.progress >= 0 ? 'cancel' : 'download');
 };
 $('intro_done').onclick = () => { introOpen = false; $('intro').classList.remove('on'); send('intro_done'); };
