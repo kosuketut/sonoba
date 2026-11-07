@@ -24,7 +24,7 @@ pub struct Config {
     pub gpu_limit_mib: Option<u64>, // None: whatever fits
     pub show_frame: bool, // a thin frame around the region while a job runs
     pub flash_frame: bool, // the frame for a moment whenever a translation finishes
-    pub source: String, // what to read: "auto", "ja" (translate Japanese too) or "ko"
+    pub source: String, // "auto" leaves the target language alone, "ja" rewrites Japanese too
     pub target: String, // a language code of the model, "ja(easy)" included
     pub ui_lang: String, // "ja" or "en"
     pub intro_done: bool, // the first-run guide was seen through
@@ -74,7 +74,7 @@ impl Config {
         config.gpu_limit_mib = saved["gpu_limit_mib"].as_u64();
         config.show_frame = saved["show_frame"].as_bool().unwrap_or(false);
         config.flash_frame = saved["flash_frame"].as_bool().unwrap_or(false);
-        if let Some(source) = saved["source"].as_str() {
+        if let Some(source) = saved["source"].as_str().filter(|s| *s == "ja") {
             config.source = source.to_string();
         }
         if let Some(target) = saved["target"].as_str() {
@@ -175,7 +175,7 @@ mod tests {
         config.gpu_limit_mib = Some(1536);
         config.show_frame = true;
         config.flash_frame = true;
-        config.source = "ko".into();
+        config.source = "ja".into();
         config.target = "ja(easy)".into();
         config.ui_lang = "en".into();
         config.intro_done = true;

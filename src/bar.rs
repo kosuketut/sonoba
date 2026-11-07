@@ -12,7 +12,7 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
-const SOURCES: [(&str, &str); 3] = [("auto", "自動"), ("ja", "日本語も翻訳"), ("ko", "韓国語")];
+const SOURCES: [(&str, &str); 2] = [("auto", "自動"), ("ja", "日本語も翻訳")];
 const TARGETS: [(&str, &str); 6] =
     [("ja", "日本語"), ("ja(easy)", "やさしい日本語"), ("en", "英語"), ("ko", "韓国語"), ("zh-hans", "中国語（簡体字）"), ("zh-hant", "中国語（繁体字）")];
 const CHIPS: usize = 3;

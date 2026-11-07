@@ -114,6 +114,8 @@ fn state() -> Value {
         "models": list,
         "model": config.model,
         "progress": models::PROGRESS.load(Ordering::Relaxed),
+        "downloading": models::DOWNLOADING.lock().unwrap().clone(),
+        "korean": { "present": models::is_present(models::KOREAN_OCR), "partial": models::has_part(models::KOREAN_OCR) },
         "engine": engine_state,
         "message": MESSAGE.with_borrow(Clone::clone),
         "device": device,
@@ -218,6 +220,12 @@ fn on_message(text: &str) {
         "intro_done" => config::update(|c| c.intro_done = true),
         // The licence binds whoever downloads the model; the page asks them first.
         "download" => models::start_download(config::get().model),
+        "korean_download" => models::start_download(models::KOREAN_OCR.to_string()),
+        "korean_delete" => {
+            if let Err(e) = models::delete(models::KOREAN_OCR) {
+                MESSAGE.set(format!("{}{e}", t("削除できません: ")));
+            }
+        }
         "cancel" => models::CANCEL.store(true, Ordering::Relaxed),
         "delete" => delete_model(),
         "load" => request_load(),

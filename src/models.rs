@@ -13,12 +13,16 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 pub const DEFAULT: &str = "plamo-3-translate-2b-Q4_K_M.gguf";
 const CATALOG: [(&str, &str); 4] = [("0.8b", "軽量、0.6GB"), ("2b", "標準、1.8GB"), ("8b", "高品質、5.3GB"), ("31b", "最高品質、19.5GB")];
 const SOURCE: &str = "https://huggingface.co";
+pub const KOREAN_OCR: &str = "korean_PP-OCRv5_mobile_rec.onnx"; // saved beside the models
+const KOREAN_REPO: &str = "PaddlePaddle/korean_PP-OCRv5_mobile_rec_onnx";
+const KOREAN_REMOTE: &str = "inference.onnx";
 
 pub const VERIFYING: i32 = 100;
 /// Percent while a download runs, then VERIFYING; -1 when there is none.
 pub static PROGRESS: AtomicI32 = AtomicI32::new(-1);
 pub static CANCEL: AtomicBool = AtomicBool::new(false);
 pub static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+pub static DOWNLOADING: Mutex<String> = Mutex::new(String::new()); // the file PROGRESS is about
 
 /// How a model expects its prompt, which is all the app needs to know about it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -117,12 +121,16 @@ fn sha256(file: &PathBuf) -> Result<String, String> {
 }
 
 fn download(file: &str) -> Result<(), String> {
-    let size = CATALOG.iter().find(|(s, _)| catalog_file(s) == file).map(|(s, _)| *s).ok_or("このモデルはダウンロードできません")?;
-    let repo = format!("pfnet/plamo-3-translate-{size}-GGUF");
-    let (total, hash) = expected(&repo, file)?;
+    let (repo, remote) = if file == KOREAN_OCR {
+        (KOREAN_REPO.to_string(), KOREAN_REMOTE)
+    } else {
+        let size = CATALOG.iter().find(|(s, _)| catalog_file(s) == file).map(|(s, _)| *s).ok_or("このモデルはダウンロードできません")?;
+        (format!("pfnet/plamo-3-translate-{size}-GGUF"), file)
+    };
+    let (total, hash) = expected(&repo, remote)?;
     std::fs::create_dir_all(dir()).map_err(|e| e.to_string())?;
     let part = part(file); // kept when cancelled, and picked up again by -C -
-    let url = format!("{SOURCE}/{repo}/resolve/main/{file}");
+    let url = format!("{SOURCE}/{repo}/resolve/main/{remote}");
     if std::fs::metadata(&part).map_or(0, |m| m.len()) < total {
         let mut curl = tool("curl").args(["-sSfL", "-C", "-", "-o"]).arg(&part).arg(&url).stdout(Stdio::null()).spawn().map_err(|e| e.to_string())?;
         crate::engine::tie_to_app(&curl);
@@ -154,6 +162,7 @@ fn download(file: &str) -> Result<(), String> {
 pub fn start_download(file: String) {
     PROGRESS.store(0, Ordering::Relaxed);
     CANCEL.store(false, Ordering::Relaxed);
+    *DOWNLOADING.lock().unwrap() = file.clone();
     std::thread::spawn(move || {
         *LAST_ERROR.lock().unwrap() = download(&file).err();
         PROGRESS.store(-1, Ordering::Relaxed);

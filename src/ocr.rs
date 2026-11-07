@@ -5,12 +5,12 @@ use crate::patch::{self, Glyphs};
 use rayon::prelude::*;
 use rten::{Model, RunOptions, ThreadPool};
 use rten_tensor::NdTensor;
+use std::path::Path;
 use std::sync::Arc;
 
 static DET: &[u8] = include_bytes!("../models/PP-OCRv6_det_small.onnx");
 static REC: &[u8] = include_bytes!("../models/PP-OCRv6_rec_small.onnx");
 static DICT: &str = include_str!("../models/dict.txt");
-static REC_KOREAN: &[u8] = include_bytes!("../models/korean_PP-OCRv5_mobile_rec.onnx");
 static DICT_KOREAN: &str = include_str!("../models/dict_korean.txt");
 
 // shortcut: long sides above this are scaled down, so a whole 4K screen of small text
@@ -24,6 +24,7 @@ const REC_HEIGHT: usize = 48;
 const REC_MIN_WIDTH: usize = 160;
 const REC_MAX_WIDTH: usize = 3200;
 const TEXT_SCORE: f32 = 0.5;
+const SURE_SCORE: f32 = 0.93; // a line read this well is no Hangul, and needs no second look
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Line {
@@ -92,25 +93,36 @@ pub struct Ocr {
     det: Model,
     rec: Model,
     chars: Vec<&'static str>,
+    korean: Option<(Model, Vec<&'static str>)>,
     pool: Arc<ThreadPool>,
     threads: usize,
-    korean: bool,
+}
+
+fn dictionary(lines: &'static str) -> Vec<&'static str> {
+    let mut chars = vec![""]; // class 0 is the CTC blank
+    chars.extend(lines.lines().filter(|s| !s.is_empty())); // git may check dict.txt out as CRLF
+    chars.push(" ");
+    chars
 }
 
 impl Ocr {
-    /// PP-OCRv6 reads Chinese, English, Japanese and Latin scripts; Hangul takes a model of its own.
-    pub fn new(threads: usize, korean: bool) -> Result<Self, String> {
+    /// PP-OCRv6 reads Chinese, English, Japanese and Latin scripts. Hangul takes a model of its
+    /// own, which comes as a download.
+    pub fn new(threads: usize, korean: Option<&Path>) -> Result<Self, String> {
         let load = |b| Model::load_static_slice(b).map_err(|e| e.to_string());
-        let (rec, dict) = if korean { (REC_KOREAN, DICT_KOREAN) } else { (REC, DICT) };
-        let mut chars = vec![""]; // class 0 is the CTC blank
-        chars.extend(dict.lines().filter(|s| !s.is_empty())); // git may check dict.txt out as CRLF
-        chars.push(" ");
+        let korean = match korean {
+            Some(path) => {
+                let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+                Some((Model::load(bytes).map_err(|e| e.to_string())?, dictionary(DICT_KOREAN)))
+            }
+            None => None,
+        };
         let pool = Arc::new(ThreadPool::with_num_threads(threads));
-        Ok(Self { det: load(DET)?, rec: load(rec)?, chars, pool, threads, korean })
+        Ok(Self { det: load(DET)?, rec: load(REC)?, chars: dictionary(DICT), korean, pool, threads })
     }
 
     pub fn matches(&self, threads: usize, korean: bool) -> bool {
-        self.threads == threads && self.korean == korean
+        self.threads == threads && self.korean.is_some() == korean
     }
 
     fn run_options(&self) -> Option<RunOptions> {
@@ -171,15 +183,28 @@ impl Ocr {
         if bw == 0 || bh == 0 {
             return Ok(String::new());
         }
+        let (text, score) = self.read_with(&self.rec, &self.chars, img, rect)?;
+        // Hangul reads badly in the main model, so doubt is what sends a line to the other one.
+        if let Some((model, chars)) = self.korean.as_ref().filter(|_| score < SURE_SCORE) {
+            let (hangul, hangul_score) = self.read_with(model, chars, img, rect)?;
+            if hangul_score > score && hangul.contains(is_hangul) {
+                return Ok(hangul);
+            }
+        }
+        Ok(if score < TEXT_SCORE { String::new() } else { text })
+    }
+
+    fn read_with(&self, model: &Model, chars: &[&str], img: &Rgbf, rect: (usize, usize, usize, usize)) -> Result<(String, f32), String> {
+        let (_, _, bw, bh) = rect;
         let width = (bw * REC_HEIGHT).div_ceil(bh).clamp(1, REC_MAX_WIDTH);
         let stride = width.max(REC_MIN_WIDTH);
         let input = NdTensor::from_data([1, 3, REC_HEIGHT, stride], img.sample_chw(rect, width, REC_HEIGHT, stride));
-        let out = self.rec.run_one(input.into(), self.run_options()).map_err(|e| e.to_string())?;
+        let out = model.run_one(input.into(), self.run_options()).map_err(|e| e.to_string())?;
         let (shape, probs) = out.into_shape_vec::<f32, 3>().map_err(|e| e.to_string())?;
-        if shape[2] != self.chars.len() {
-            return Err(format!("model has {} classes, dictionary {}", shape[2], self.chars.len()));
+        if shape[2] != chars.len() {
+            return Err(format!("model has {} classes, dictionary {}", shape[2], chars.len()));
         }
-        Ok(ctc_decode(&probs, shape[2], &self.chars))
+        Ok(ctc_decode(&probs, shape[2], chars))
     }
 }
 
@@ -230,7 +255,12 @@ fn text_boxes(prob: &[f32], w: usize, h: usize) -> Vec<(f32, f32, f32, f32)> {
     boxes
 }
 
-fn ctc_decode(probs: &[f32], classes: usize, chars: &[&str]) -> String {
+fn is_hangul(c: char) -> bool {
+    matches!(c, '\u{AC00}'..='\u{D7A3}')
+}
+
+/// The text, and how sure the model was of it.
+fn ctc_decode(probs: &[f32], classes: usize, chars: &[&str]) -> (String, f32) {
     let (mut text, mut sum, mut n, mut prev) = (String::new(), 0f32, 0f32, 0);
     for step in probs.chunks_exact(classes) {
         let (best, &p) = step.iter().enumerate().fold((0, &step[0]), |a, b| if b.1 > a.1 { b } else { a });
@@ -241,7 +271,7 @@ fn ctc_decode(probs: &[f32], classes: usize, chars: &[&str]) -> String {
         }
         prev = best;
     }
-    if n == 0.0 || sum / n < TEXT_SCORE { String::new() } else { text.trim().to_string() }
+    if n == 0.0 { (String::new(), 0.0) } else { (text.trim().to_string(), sum / n) }
 }
 
 /// The recogniser reads an icon as a stray character or two, such as a circled digit.
@@ -461,18 +491,18 @@ mod tests {
             0.1, 0.8, 0.1, // a again
             0.0, 0.1, 0.9, // b
         ];
-        assert_eq!(ctc_decode(&probs, 3, &chars), "aab");
+        assert_eq!(ctc_decode(&probs, 3, &chars).0, "aab");
     }
 
     #[test]
-    fn low_confidence_text_is_dropped() {
-        assert_eq!(ctc_decode(&[0.3, 0.4, 0.3], 3, &["", "a", "b"]), "");
+    fn doubt_shows_in_the_score() {
+        assert!(ctc_decode(&[0.3, 0.4, 0.3], 3, &["", "a", "b"]).1 < TEXT_SCORE);
     }
 
     /// Boxes are taller than the glyphs, so a blank line looks smaller than a line height.
     #[test]
     fn blank_line_separates_paragraphs() {
-        let ocr = Ocr::new(4, false).unwrap();
+        let ocr = Ocr::new(4, None).unwrap();
         let (bgra, w, h) = png_bgra("testdata/paragraphs.png");
         let lines = ocr.read(&bgra, w, h).unwrap();
         let got = paragraphs(&lines);
@@ -482,7 +512,7 @@ mod tests {
 
     #[test]
     fn bold_is_recognised_at_heading_and_body_sizes() {
-        let ocr = Ocr::new(4, false).unwrap();
+        let ocr = Ocr::new(4, None).unwrap();
         let (bgra, w, h) = png_bgra("testdata/weights.png");
         let blocks = paragraphs(&ocr.read(&bgra, w, h).unwrap());
         let got: Vec<_> = blocks
@@ -504,7 +534,7 @@ mod tests {
     /// Video frames are noisy, and once brought the seam search down to a line of no height.
     #[test]
     fn noisy_frames_never_panic() {
-        let ocr = Ocr::new(4, false).unwrap();
+        let ocr = Ocr::new(4, None).unwrap();
         let (clean, w, h) = png_bgra("testdata/paragraphs.png");
         let mut seed = 0x2545F4914F6CDD1Du64;
         let mut next = move || {
@@ -539,7 +569,7 @@ mod tests {
         const WANT: &str = "The quick update changes how background tasks are scheduled. If your session expires, \
             you'll need to sign in again before saving. Don't close this window until the upload has finished, \
             otherwise the file may be incomplete.";
-        let ocr = Ocr::new(4, false).unwrap();
+        let ocr = Ocr::new(4, None).unwrap();
         for name in ["dark-14px", "game-22px", "mono-13px", "ui-12px", "ui-14px", "web-16px"] {
             let (bgra, w, h) = png_bgra(&format!("testdata/{name}.png"));
             let start = std::time::Instant::now();
@@ -554,10 +584,29 @@ mod tests {
     #[test]
     fn reads_hangul_with_its_own_model() {
         let (bgra, w, h) = png_bgra("testdata/korean.png");
-        let lines = Ocr::new(4, true).unwrap().read(&bgra, w, h).unwrap();
+        let lines = with_korean().read(&bgra, w, h).unwrap();
         let got = paragraphs(&lines).iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" / ");
         println!("{got}");
         assert!(got.contains("화면의 글자를 번역합니다") && got.contains("언어를 바꿀 수 있습니다"), "{got}");
+    }
+
+    fn with_korean() -> Ocr {
+        Ocr::new(4, Some(Path::new("models/korean_PP-OCRv5_mobile_rec.onnx"))).unwrap()
+    }
+
+    #[test]
+    fn the_korean_download_leaves_other_languages_alone() {
+        let ocr = with_korean();
+        for (name, want) in [("mixed-en", "Please read the manual"), ("mixed-ja", "取扱説明書をよく読んでください"), ("mixed-zh", "请仔细阅读说明书")] {
+            let (bgra, w, h) = png_bgra(&format!("testdata/{name}.png"));
+            let got = paragraphs(&ocr.read(&bgra, w, h).unwrap()).iter().map(|b| b.text.clone()).collect::<Vec<_>>().join(" / ");
+            println!("{name}: {got}");
+            assert!(got.contains(want), "{name}: {got}");
+            assert!(!got.contains(is_hangul), "{name}: {got}");
+        }
+        let (bgra, w, h) = png_bgra("testdata/ui-14px.png");
+        let got = paragraphs(&ocr.read(&bgra, w, h).unwrap()).iter().map(|b| b.text.clone()).collect::<Vec<_>>().join(" ");
+        assert!(!got.contains(is_hangul), "{got}");
     }
 
     #[test]

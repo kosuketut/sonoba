@@ -125,6 +125,11 @@ kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(
       <div class="row"><div><b data-t="target"></b></div><select id="target"></select></div>
     </div>
     <p class="hint" data-t="easy_note"></p>
+    <div class="card">
+      <div class="row"><div><b data-t="korean"></b><small id="korean_status"></small></div>
+        <span><button class="btn" id="korean_delete" data-t="delete"></button> <button class="btn main" id="korean_download"></button></span></div>
+      <div class="bar" id="korean_bar"><i></i></div>
+    </div>
   </section>
 
   <section id="model">
@@ -228,7 +233,8 @@ const TEXT = {
   ja: {
     nav_translate: '翻訳', nav_model: 'モデル', nav_keys: 'ホットキー', nav_look: '表示', nav_run: '動作', nav_about: '情報',
     source: '翻訳元', source_note: '読み取る文字の種類です', target: '翻訳先',
-    src_auto: '自動（翻訳先の言語は触らない）', src_ja: '日本語も翻訳する', src_ko: '韓国語',
+    src_auto: '自動（翻訳先の言語は触らない）', src_ja: '日本語も翻訳する',
+    korean: '韓国語を読み取る', ko_none: '追加のダウンロードが必要です（13MB）。入れると、ほかの言語と同じように自動で翻訳します', ko_on: '入っています。ハングルも自動で翻訳します', ko_part: '途中までダウンロードしてあります（続きから再開できます）',
     tgt_ja: '日本語', tgt_easy: 'やさしい日本語', tgt_en: '英語', tgt_ko: '韓国語', tgt_hans: '中国語（簡体字）', tgt_hant: '中国語（繁体字）',
     easy_note: '翻訳先を「やさしい日本語」にすると、外国語をやさしい日本語に訳します。画面の日本語もやさしくしたいときは、翻訳元を「日本語も翻訳する」にします。範囲を選ぶときの上のバーでも切り替えられます。',
     model: '翻訳モデル', download: 'ダウンロード', cancel: '中止', delete: '削除', load: '読み込む', unload: 'アンロード',
@@ -252,7 +258,8 @@ const TEXT = {
   en: {
     nav_translate: 'Translation', nav_model: 'Model', nav_keys: 'Hotkeys', nav_look: 'Appearance', nav_run: 'System', nav_about: 'About',
     source: 'Translate from', source_note: 'The kind of text to read', target: 'Translate into',
-    src_auto: 'Automatic (leave the target language alone)', src_ja: 'Japanese too', src_ko: 'Korean',
+    src_auto: 'Automatic (leave the target language alone)', src_ja: 'Japanese too',
+    korean: 'Read Korean', ko_none: 'Needs a small download (13 MB). After that, Korean is translated automatically like the other languages', ko_on: 'Installed. Korean is translated automatically', ko_part: 'Partly downloaded (it can resume)',
     tgt_ja: 'Japanese', tgt_easy: 'Easy Japanese', tgt_en: 'English', tgt_ko: 'Korean', tgt_hans: 'Chinese (Simplified)', tgt_hant: 'Chinese (Traditional)',
     easy_note: 'Easy Japanese turns foreign text into plain Japanese. To simplify the Japanese on screen as well, set the source to "Japanese too". The bar shown while selecting a region switches these too.',
     model: 'Translation model', download: 'Download', cancel: 'Cancel', delete: 'Delete', load: 'Load', unload: 'Unload',
@@ -319,7 +326,7 @@ function render(s) {
   document.documentElement.lang = s.ui_lang;
   document.title = s.title;
   for (const el of document.querySelectorAll('[data-t]')) el.textContent = T(el.dataset.t);
-  options($('source'), [['auto', T('src_auto')], ['ja', T('src_ja')], ['ko', T('src_ko')]], s.source);
+  options($('source'), [['auto', T('src_auto')], ['ja', T('src_ja')]], s.source);
   options($('target'), [['ja', T('tgt_ja')], ['ja(easy)', T('tgt_easy')], ['en', T('tgt_en')], ['ko', T('tgt_ko')], ['zh-hans', T('tgt_hans')], ['zh-hant', T('tgt_hant')]], s.target);
   options($('models'), s.models.map(m => [m.file, m.label]), s.model);
   options($('device'), [['auto', T('dev_auto')], ['gpu', T('dev_gpu')], ['cpu', T('dev_cpu')]], s.device);
@@ -337,10 +344,17 @@ function render(s) {
   }
   const m = s.models.find(x => x.file === s.model) ?? {};
   const downloading = s.progress >= 0;
-  $('status').textContent = statusOf(s);
-  bar($('bar'), s);
+  const packDown = downloading && s.downloading.startsWith('korean');
+  $('status').textContent = packDown ? T(m.present ? 'st_idle' : 'st_none') : statusOf(s);
+  bar($('bar'), packDown ? { progress: -1 } : s);
+  bar($('korean_bar'), packDown ? s : { progress: -1 });
+  $('korean_status').textContent = packDown ? (s.progress === 100 ? T('st_verify') : T('st_down') + ' ' + s.progress + '%') : T(s.korean.present ? 'ko_on' : s.korean.partial ? 'ko_part' : 'ko_none');
+  $('korean_download').textContent = T(packDown ? 'cancel' : 'download');
+  $('korean_download').hidden = s.korean.present;
+  $('korean_download').disabled = (downloading && !packDown) || s.progress === 100;
+  $('korean_delete').hidden = !(s.korean.present || s.korean.partial) || packDown;
   $('download').textContent = T(downloading ? 'cancel' : 'download');
-  $('download').disabled = !((downloading && s.progress !== 100) || (!downloading && !m.present && m.download));
+  $('download').disabled = packDown || !((downloading && s.progress !== 100) || (!downloading && !m.present && m.download));
   $('delete').disabled = !((m.present || m.partial) && !downloading);
   $('load').disabled = !(m.present && !downloading && s.engine === 'unloaded');
   $('unload').disabled = s.engine === 'unloaded';
@@ -400,6 +414,8 @@ $('delete').onclick = () => {
   const m = state.models.find(x => x.file === state.model);
   ask(T('ask_delete'), m.file + ' ' + T('ask_delete_q') + '\n' + T(m.download ? 'del_again' : 'del_gone'), T('del_yes'), () => send('delete'));
 };
+$('korean_download').onclick = () => send(state.progress >= 0 ? 'cancel' : 'korean_download');
+$('korean_delete').onclick = () => send('korean_delete');
 $('load').onclick = () => send('load');
 $('unload').onclick = () => send('unload');
 for (const a of [$('license'), $('intro_license')]) a.onclick = () => send('open', LICENSE[state.ui_lang] ?? LICENSE.ja);

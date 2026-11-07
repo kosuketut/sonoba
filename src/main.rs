@@ -177,11 +177,11 @@ fn worker(overlay: usize) {
 }
 
 /// Loads the OCR models, or reloads them if the thread setting has changed.
-fn ensure_ocr(models: &mut Option<ocr::Ocr>) -> Result<(), String> {
-    let config = config::get();
-    let (threads, korean) = (config.threads(), config.source == "ko");
-    if !models.as_ref().is_some_and(|m| m.matches(threads, korean)) {
-        *models = Some(ocr::Ocr::new(threads, korean)?);
+fn ensure_ocr(ocr_models: &mut Option<ocr::Ocr>) -> Result<(), String> {
+    let threads = config::get().threads();
+    let korean = models::is_present(models::KOREAN_OCR).then(|| models::path(models::KOREAN_OCR));
+    if !ocr_models.as_ref().is_some_and(|m| m.matches(threads, korean.is_some())) {
+        *ocr_models = Some(ocr::Ocr::new(threads, korean.as_deref())?);
     }
     Ok(())
 }
@@ -516,6 +516,11 @@ thread_local! {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
+}
+
+/// For the calls that take no length and read up to a NUL.
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
 }
 
 fn lparam_xy(l: LPARAM) -> (i32, i32) {
@@ -991,7 +996,7 @@ fn show_patches(mut patches: Vec<Patch>) {
 
         let height = patches.iter().map(|p| p.y + p.h).max().unwrap_or(0).max(region.h);
         let text = patches.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
-        SetWindowTextW(overlay, wide(&format!("{text}\0")).as_ptr()); // keeps it readable by screen readers
+        SetWindowTextW(overlay, wide_z(&text).as_ptr()); // keeps it readable by screen readers
         *ui.patches.borrow_mut() = patches;
         // Behind a minimised window the result waits for it to come back.
         let show = if PAUSED.load(Ordering::Relaxed) { 0 } else { SWP_SHOWWINDOW };
@@ -1123,8 +1128,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
 unsafe fn tray_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, wide(&t("設定")).as_ptr());
-        AppendMenuW(menu, MF_STRING, MENU_EXIT, wide(&t("終了")).as_ptr());
+        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, wide_z(&t("設定")).as_ptr());
+        AppendMenuW(menu, MF_STRING, MENU_EXIT, wide_z(&t("終了")).as_ptr());
         let mut at = POINT { x: 0, y: 0 };
         GetCursorPos(&mut at);
         SetForegroundWindow(hwnd); // Windows only dismisses a tray menu properly this way
@@ -1349,7 +1354,7 @@ fn main() {
         bar::register_class();
         let hotkeys_ok = register_hotkeys();
         if !hotkeys_ok {
-            let warning = wide(&t("ホットキーを登録できません。別のアプリが使っています。設定で変更してください。"));
+            let warning = wide_z(&t("ホットキーを登録できません。別のアプリが使っています。設定で変更してください。"));
             MessageBoxW(null_mut(), warning.as_ptr(), w!("screen-translate"), MB_OK | MB_ICONWARNING);
         }
         if !hotkeys_ok || !models::is_present(&config::get().model) {
