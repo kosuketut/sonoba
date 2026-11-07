@@ -468,6 +468,7 @@ struct Ui {
     main: Cell<HWND>,
     overlay: Cell<HWND>,
     frame: Cell<HWND>,
+    selecting: Cell<Option<Region>>, // the drag so far, in screen pixels
     flashing: Cell<bool>,
     select: Cell<HWND>,
     live_next: Cell<bool>, // the selection in progress starts a live job
@@ -488,6 +489,7 @@ thread_local! {
         main: Cell::new(null_mut()),
         overlay: Cell::new(null_mut()),
         frame: Cell::new(null_mut()),
+        selecting: Cell::new(None),
         flashing: Cell::new(false),
         select: Cell::new(null_mut()),
         live_next: Cell::new(false),
@@ -538,16 +540,27 @@ pub fn update_frame() {
         let frame = ui.frame.get();
         let config = config::get();
         let flashing = ui.flashing.get();
-        let wanted = ui.job_id.get() != 0 && !PAUSED.load(Ordering::Relaxed) && (config.show_frame || flashing);
-        let region = ui.region.get();
+        let selecting = ui.selecting.get();
+        let wanted = selecting.is_some() || ui.job_id.get() != 0 && !PAUSED.load(Ordering::Relaxed) && (config.show_frame || flashing);
+        let region = selecting.unwrap_or(ui.region.get());
         if !wanted || region.w <= 0 || region.h <= 0 {
             ShowWindow(frame, SW_HIDE);
             return;
         }
         let t = (if flashing { FLASH_PX } else { FRAME_PX }) * GetDpiForWindow(frame) as i32 / 96;
-        SetWindowPos(frame, HWND_TOPMOST, region.x - t, region.y - t, region.w + t * 2, region.h + t * 2, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let outer = RECT { left: region.x - t, top: region.y - t, right: region.x + region.w + t, bottom: region.y + region.h + t };
+        let r = frame_rect(region, outer, on_its_monitor(&outer));
+        SetWindowPos(frame, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         InvalidateRect(frame, null(), 0);
+        UpdateWindow(frame); // a drag resizes it on every move
     });
+}
+
+/// `visible` is the part of `outer` its monitor shows. A maximised window has no outside, so the
+/// frame comes in over its edge; a region across monitors keeps the whole frame.
+fn frame_rect(region: Region, outer: RECT, visible: RECT) -> RECT {
+    let fits = visible.left <= region.x && visible.top <= region.y && visible.right >= region.x + region.w && visible.bottom >= region.y + region.h;
+    if fits { visible } else { outer }
 }
 
 unsafe fn paint_frame(hwnd: HWND) {
@@ -741,6 +754,8 @@ unsafe fn end_select() {
             ReleaseCapture();
             DestroyWindow(select);
         }
+        ui.selecting.set(None);
+        update_frame();
     });
 }
 
@@ -855,8 +870,15 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         }
                         InvalidateRect(hwnd, &old, 0);
                         InvalidateRect(hwnd, &selection_rect(from, at), 0);
+                        let rect = selection_rect(from, at);
+                        let mut origin = POINT { x: 0, y: 0 };
+                        ClientToScreen(hwnd, &mut origin);
+                        ui.selecting.set((!is_small(&rect)).then(|| Region { x: rect.left + origin.x, y: rect.top + origin.y, w: rect.right - rect.left, h: rect.bottom - rect.top }));
                     })
                 });
+                if dragging.is_some() {
+                    update_frame();
+                }
                 if dragging.is_none() {
                     update_hover(hwnd);
                 }
@@ -1259,6 +1281,7 @@ fn main() {
             null(),
         );
         SetLayeredWindowAttributes(frame, KEY_COLOR, 255, LWA_COLORKEY);
+        SetWindowDisplayAffinity(frame, WDA_EXCLUDEFROMCAPTURE); // it can sit on the region's edge
         UI.with(|ui| {
             ui.main.set(main);
             ui.overlay.set(overlay);
@@ -1292,6 +1315,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_stays_on_the_screen() {
+        let screen = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let around = |x, y, w, h| {
+            let region = Region { x, y, w, h };
+            let outer = RECT { left: x - 2, top: y - 2, right: x + w + 2, bottom: y + h + 2 };
+            let visible = RECT { left: outer.left.max(0), top: outer.top.max(0), right: outer.right.min(1920), bottom: outer.bottom.min(1080) };
+            frame_rect(region, outer, visible)
+        };
+        let r = around(100, 100, 300, 200);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (98, 98, 402, 302));
+        let r = around(0, 0, 1920, 1080);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (screen.left, screen.top, screen.right, screen.bottom));
+        let r = around(1800, 100, 300, 200); // into the next monitor
+        assert_eq!((r.left, r.right), (1798, 2102));
+    }
 
     #[test]
     fn readings_that_differ_by_a_letter_are_one_reading() {
