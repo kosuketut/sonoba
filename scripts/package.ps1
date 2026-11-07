@@ -1,9 +1,11 @@
-# Builds dist/screen-translate-<version>.zip: the app plus the official llama.cpp Vulkan engine.
+# Builds dist/screen-translate-<version>.zip: the app plus the official llama.cpp Vulkan engine,
+# with the Visual C++ runtime that engine needs and every license text.
 # The model is not in the package: users download it from the settings window.
 $ErrorActionPreference = 'Stop'
 $tag = 'b12144'
 $asset = "llama-$tag-bin-win-vulkan-x64.zip"
 $sha256 = '4824892a8bf28726a2790c8c9041e146c4357c51f6fb22184f8ac58985ed6384'
+$runtimeNeeded = [version]'14.51' # ggml-vulkan.dll was built with this, and the runtime may not be older
 
 $root = Split-Path $PSScriptRoot
 $version = (Select-String -Path "$root\Cargo.toml" -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
@@ -26,6 +28,17 @@ if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $sha256) {
     throw "$asset does not match its expected hash"
 }
 Expand-Archive $zip "$stage\engine"
+
+# Not every Windows has the Visual C++ runtime, so it goes beside the engine. These are the files
+# of Microsoft's redistributable package, which the machine building this has installed.
+foreach ($file in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
+    $dll = Get-Item "$env:WINDIR\System32\$file"
+    if ([version]$dll.VersionInfo.FileVersion -lt $runtimeNeeded) { throw "$file is older than $runtimeNeeded" }
+    Copy-Item $dll.FullName "$stage\engine"
+}
+
+& "$PSScriptRoot\licenses.ps1"
+Copy-Item "$root\licenses" $stage -Recurse
 
 Copy-Item "$root\target\release\screen-translate.exe", "$root\README.md", "$root\LICENSE", "$root\NOTICE.md" $stage
 Compress-Archive "$stage\*" "$dist\$name.zip" -Force
