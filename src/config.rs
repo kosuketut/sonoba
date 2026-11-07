@@ -19,6 +19,8 @@ pub struct Hotkey {
 }
 
 impl Hotkey {
+    pub const OFF: Hotkey = Hotkey { mods: 0, key: 0 };
+
     pub fn is_mouse(&self) -> bool {
         (MOUSE_MIDDLE..=MOUSE_FORWARD).contains(&self.key)
     }
@@ -222,6 +224,7 @@ mod tests {
         config.intro_done = true;
         config.hotkeys[1] = Hotkey { mods: 6, key: 0x70 };
         config.hotkeys[4] = Hotkey { mods: 0, key: 5 };
+        config.hotkeys[3] = Hotkey::OFF;
         config.form = "polite".into();
         config.glossary = vec![("bank".into(), "川岸".into())];
         config.font = "Meiryo".into();

@@ -52,6 +52,13 @@ select, .key {
 select { cursor: pointer; }
 .key { cursor: pointer; text-align: center; font-variant-numeric: tabular-nums; }
 .key.wait { border-color: var(--accent); color: var(--accent); }
+.key.off { color: var(--soft); }
+.keyset { display: flex; align-items: center; gap: 6px; flex: none; }
+.keyset .key { min-width: 170px; }
+.mini { all: unset; cursor: pointer; color: var(--soft); font-size: 12.5px; padding: 3px 6px; border-radius: 6px; white-space: nowrap; }
+.mini:hover:not(:disabled) { color: var(--accent); }
+.mini:disabled { opacity: .4; cursor: default; }
+.mini:focus-visible { outline: 2px solid var(--accent); }
 .key.taken { border-color: var(--danger); color: var(--danger); }
 select:focus-visible, .key:focus-visible, .btn:focus-visible, .choice:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .btn {
@@ -171,13 +178,14 @@ kbd { font: inherit; font-size: 12.5px; padding: 2px 8px; border: 1px solid var(
   <section id="keys">
     <h1 data-t="nav_keys"></h1>
     <div class="card">
-      <div class="row"><div><b data-t="key_once"></b></div><button class="key" data-key="0"></button></div>
-      <div class="row"><div><b data-t="key_live"></b></div><button class="key" data-key="1"></button></div>
-      <div class="row"><div><b data-t="key_clear"></b></div><button class="key" data-key="2"></button></div>
-      <div class="row"><div><b data-t="key_peek"></b><small data-t="key_peek_note"></small></div><button class="key" data-key="3"></button></div>
-      <div class="row"><div><b data-t="key_copy"></b></div><button class="key" data-key="4"></button></div>
+      <div class="row"><div><b data-t="key_once"></b></div><span class="keyset"><button class="key" data-key="0"></button><button class="mini" data-reset="0" data-t="key_reset"></button><button class="mini" data-off="0" data-t="key_disable"></button></span></div>
+      <div class="row"><div><b data-t="key_live"></b></div><span class="keyset"><button class="key" data-key="1"></button><button class="mini" data-reset="1" data-t="key_reset"></button><button class="mini" data-off="1" data-t="key_disable"></button></span></div>
+      <div class="row"><div><b data-t="key_clear"></b></div><span class="keyset"><button class="key" data-key="2"></button><button class="mini" data-reset="2" data-t="key_reset"></button><button class="mini" data-off="2" data-t="key_disable"></button></span></div>
+      <div class="row"><div><b data-t="key_peek"></b><small data-t="key_peek_note"></small></div><span class="keyset"><button class="key" data-key="3"></button><button class="mini" data-reset="3" data-t="key_reset"></button><button class="mini" data-off="3" data-t="key_disable"></button></span></div>
+      <div class="row"><div><b data-t="key_copy"></b></div><span class="keyset"><button class="key" data-key="4"></button><button class="mini" data-reset="4" data-t="key_reset"></button><button class="mini" data-off="4" data-t="key_disable"></button></span></div>
     </div>
     <p class="hint" data-t="key_note"></p>
+    <button class="btn" id="keys_reset" data-t="keys_reset"></button>
   </section>
 
   <section id="look">
@@ -281,6 +289,7 @@ const TEXT = {
     model_note: 'GGUF ファイルをモデルのフォルダに置くと一覧に出ます。',
     key_once: '範囲を 1 回翻訳', key_live: 'リアルタイム翻訳', key_clear: '訳文を消す', key_wait: 'キーを押してください…',
     key_note: 'Ctrl か Alt を含むキー、またはマウスの中ボタンとサイドボタンを押します。Esc で取り消せます。', key_bad: 'Ctrl か Alt を含めてください',
+    key_reset: 'リセット', key_disable: '無効', keys_reset: 'すべて既定に戻す', key_none: '無効',
     key_taken: '別のアプリが使っています。別のキーにしてください', key_peek: '押している間だけ原文を見る', key_peek_note: '離すと訳文に戻ります', key_copy: '訳文をコピー',
     mouse_mid: 'マウス中ボタン', mouse_back: 'マウス戻るボタン', mouse_next: 'マウス進むボタン',
     form: '文体', form_note: '翻訳先が日本語のときに使います', form_auto: 'おまかせ（原文に合わせる）', form_polite: 'です・ます調', form_plain: 'だ・である調',
@@ -313,6 +322,7 @@ const TEXT = {
     model_note: 'GGUF files placed in the model folder appear in this list.',
     key_once: 'Translate a region once', key_live: 'Live translation', key_clear: 'Clear the translation', key_wait: 'Press the keys…',
     key_note: 'Press a combination with Ctrl or Alt, or the middle or a side mouse button. Esc cancels.', key_bad: 'Include Ctrl or Alt',
+    key_reset: 'Reset', key_disable: 'Disable', keys_reset: 'Reset all to defaults', key_none: 'Disabled',
     key_taken: 'Another app holds this key. Choose another', key_peek: 'Show the original while held', key_peek_note: 'The translation returns on release', key_copy: 'Copy the translation',
     mouse_mid: 'Middle mouse button', mouse_back: 'Mouse back button', mouse_next: 'Mouse forward button',
     form: 'Style', form_note: 'For Japanese output', form_auto: 'Automatic (follows the original)', form_polite: 'Polite (desu/masu)', form_plain: 'Plain (da/dearu)',
@@ -364,7 +374,7 @@ function keyName(v) {
   return { 0x20: 'Space', 0x09: 'Tab', 0x0D: 'Enter', 0x08: 'Backspace', 0x2D: 'Insert', 0x2E: 'Delete', 0x24: 'Home', 0x23: 'End', 0x21: 'PageUp', 0x22: 'PageDown',
     0x25: '←', 0x26: '↑', 0x27: '→', 0x28: '↓', 0xBA: ':', 0xBB: ';', 0xBC: ',', 0xBD: '-', 0xBE: '.', 0xBF: '/', 0xC0: '@', 0xDB: '[', 0xDC: '¥', 0xDD: ']', 0xDE: '^', 0xE2: '\\' }[v] ?? 'VK ' + v.toString(16);
 }
-const hotkey = h => [h.mods & 2 && 'Ctrl', h.mods & 1 && 'Alt', h.mods & 4 && 'Shift', keyName(h.key)].filter(Boolean).join(' + ');
+const hotkey = h => !h.key ? T('key_none') : [h.mods & 2 && 'Ctrl', h.mods & 1 && 'Alt', h.mods & 4 && 'Shift', keyName(h.key)].filter(Boolean).join(' + ');
 function statusOf(s) {
   const m = s.models.find(x => x.file === s.model);
   if (!m) return '';
@@ -406,6 +416,10 @@ function render(s) {
     b.textContent = i === waiting ? T('key_wait') : hotkey(s.hotkeys[i]);
     b.title = s.taken.includes(i) ? T('key_taken') : '';
     b.classList.toggle('taken', s.taken.includes(i));
+    b.classList.toggle('off', !s.hotkeys[i].key);
+    const same = (a, c) => a.mods === c.mods && a.key === c.key;
+    document.querySelector(`[data-reset="${i}"]`).disabled = same(s.hotkeys[i], s.default_hotkeys[i]);
+    document.querySelector(`[data-off="${i}"]`).disabled = !s.hotkeys[i].key;
   }
   const m = s.models.find(x => x.file === s.model) ?? {};
   const downloading = s.progress >= 0;
@@ -527,20 +541,30 @@ $('korean_delete').onclick = () => send('korean_delete');
 $('load').onclick = () => send('load');
 $('unload').onclick = () => send('unload');
 for (const a of [$('license'), $('intro_license'), $('work_license')]) a.onclick = () => send('open', LICENSE[state.ui_lang] ?? LICENSE.ja);
-for (const b of document.querySelectorAll('[data-key]')) b.onclick = () => { waiting = +b.dataset.key; render(state); };
+function choosing(index) {
+  if (waiting >= 0 !== index >= 0) send('capture', index >= 0);
+  waiting = index;
+  render(state);
+}
+for (const b of document.querySelectorAll('[data-key]')) b.onclick = () => choosing(+b.dataset.key);
+for (const b of document.querySelectorAll('[data-reset]')) b.onclick = () => send('hotkey_reset', +b.dataset.reset);
+for (const b of document.querySelectorAll('[data-off]')) b.onclick = () => send('hotkey_off', +b.dataset.off);
+$('keys_reset').onclick = () => send('hotkey_reset', null);
+addEventListener('blur', () => { if (waiting >= 0) choosing(-1); });
 addEventListener('keydown', e => {
   if (waiting < 0) return;
   e.preventDefault();
   if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) return;
   const index = waiting;
+  if (e.key === 'Escape') return choosing(-1);
+  if (!e.ctrlKey && !e.altKey) { choosing(-1); state.message = T('key_bad'); return render(state); }
   waiting = -1;
-  if (e.key === 'Escape') return render(state);
-  if (!e.ctrlKey && !e.altKey) { state.message = T('key_bad'); return render(state); }
   post({ cmd: 'hotkey', index, mods: (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 4 : 0), key: e.keyCode });
 }, true);
 addEventListener('keyup', e => { if (waiting >= 0) e.preventDefault(); }, true);
 addEventListener('mousedown', e => {
   const key = { 1: 4, 3: 5, 4: 6 }[e.button];
+  if (waiting >= 0 && e.button === 0 && !e.target.closest('[data-key]')) return choosing(-1);
   if (waiting < 0 || !key) return;
   e.preventDefault(); e.stopPropagation();
   const index = waiting;

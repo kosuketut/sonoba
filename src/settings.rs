@@ -45,6 +45,7 @@ thread_local! {
     static SENT: RefCell<String> = const { RefCell::new(String::new()) };
     static MESSAGE: RefCell<String> = const { RefCell::new(String::new()) };
     static FONTS: OnceCell<Vec<String>> = const { OnceCell::new() };
+    static CHOOSING_KEY: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn window() -> HWND {
@@ -154,6 +155,7 @@ fn state() -> Value {
         "cpu_auto": engine::performance_cores(),
         "cpu_max": std::thread::available_parallelism().map_or(1, |n| n.get()),
         "hotkeys": hotkeys,
+        "default_hotkeys": config::Config::default().hotkeys.iter().map(|h| json!({ "mods": h.mods, "key": h.key })).collect::<Vec<_>>(),
         "show_frame": config.show_frame,
         "flash_frame": config.flash_frame,
         "source": config.source,
@@ -191,12 +193,28 @@ fn hotkey_changed(index: usize, new: Hotkey) {
         return;
     }
     hotkeys[index] = new;
-    let repeated = (0..hotkeys.len()).any(|i| i != index && hotkeys[i] == new);
-    if repeated || !try_hotkeys(new) {
+    let repeated = new != Hotkey::OFF && (0..hotkeys.len()).any(|i| i != index && hotkeys[i] == new);
+    crate::pause_hotkeys(); // its own key must not look taken
+    if repeated || (new != Hotkey::OFF && !try_hotkeys(new)) {
         MESSAGE.set(t("そのキーは使えません（別の操作や別のアプリが使っています）"));
-        return;
+    } else {
+        config::update(|c| c.hotkeys = hotkeys);
     }
-    config::update(|c| c.hotkeys = hotkeys);
+    CHOOSING_KEY.set(false);
+    crate::resume_hotkeys();
+}
+
+/// The keys go back to the defaults, except that none may land on another action's key.
+fn reset_hotkeys(index: Option<usize>) {
+    let defaults = config::Config::default().hotkeys;
+    match index {
+        Some(index) if index < defaults.len() => hotkey_changed(index, defaults[index]),
+        Some(_) => {}
+        None => {
+            config::update(|c| c.hotkeys = defaults);
+            crate::resume_hotkeys();
+        }
+    }
 }
 
 /// A changed choice takes effect with the next load, or right away if a model is in memory.
@@ -304,6 +322,12 @@ fn on_message(text: &str) {
         "delete" => delete_model(),
         "load" => request_load(),
         "unload" => crate::unload_now(),
+        "capture" => {
+            CHOOSING_KEY.set(flag);
+            if flag { crate::pause_hotkeys() } else { crate::resume_hotkeys() }
+        }
+        "hotkey_reset" => reset_hotkeys(value.as_u64().map(|i| i as usize)),
+        "hotkey_off" => hotkey_changed(value.as_u64().unwrap_or(u64::MAX) as usize, Hotkey::OFF),
         "hotkey" => {
             if let (Some(index), Some(mods), Some(key)) = (message["index"].as_u64(), message["mods"].as_u64(), message["key"].as_u64()) {
                 hotkey_changed(index as usize, Hotkey { mods: mods as u32, key: key as u32 });
@@ -401,12 +425,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 info.ptMinTrackSize = POINT { x: MIN_WIDTH * dpi / 96, y: MIN_HEIGHT * dpi / 96 };
                 0
             }
-            // Keys are for the hotkey boxes, but only while this window has the focus.
             WM_ACTIVATE => {
                 if w & 0xFFFF == WA_INACTIVE as usize || w >> 16 != 0 {
-                    crate::resume_hotkeys();
+                    if CHOOSING_KEY.replace(false) {
+                        crate::resume_hotkeys();
+                    }
                 } else {
-                    crate::pause_hotkeys();
                     CONTROLLER.with_borrow(|controller| {
                         if let Some(controller) = controller {
                             let _ = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
@@ -423,7 +447,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 }
                 SENT.set(String::new());
                 WINDOW.set(null_mut());
-                crate::resume_hotkeys();
+                if CHOOSING_KEY.replace(false) {
+                    crate::resume_hotkeys();
+                }
                 0
             }
             _ => DefWindowProcW(hwnd, msg, w, l),

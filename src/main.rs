@@ -8,6 +8,7 @@
 
 mod bar;
 mod capture;
+mod toast;
 mod config;
 mod engine;
 mod i18n;
@@ -72,6 +73,8 @@ const FLASH_TIMER: usize = 1;
 const FLASH_MS: u32 = 450;
 const PEEK_TIMER: usize = 2;
 const PEEK_MS: u32 = 30;
+const CLIPBOARD_TRIES: usize = 25;
+const CLIPBOARD_WAIT: Duration = Duration::from_millis(20);
 const FRAME_PX: i32 = 2;
 const FLASH_PX: i32 = 4;
 const OUTLINE_EVERY_PX: i32 = 18; // of font size, for the outline of text on a picture
@@ -586,6 +589,7 @@ fn stop() {
         ui.job_id.set(0);
         ui.flashing.set(false);
         ui.peeking.set(false);
+        ui.patches.borrow_mut().clear();
         ShowWindow(ui.overlay.get(), SW_HIDE);
         ShowWindow(ui.frame.get(), SW_HIDE);
         if !ui.hook.get().is_null() {
@@ -1122,7 +1126,15 @@ fn peek_end() {
 pub fn copy_to_clipboard(text: &str) -> bool {
     let units: Vec<u16> = wide_z(text);
     UI.with(|ui| unsafe {
-        if OpenClipboard(ui.main.get()) == 0 {
+        // Other apps open the clipboard for a moment whenever it changes.
+        let opened = (0..CLIPBOARD_TRIES).any(|_| {
+            let opened = OpenClipboard(ui.main.get()) != 0;
+            if !opened {
+                std::thread::sleep(CLIPBOARD_WAIT);
+            }
+            opened
+        });
+        if !opened {
             return false;
         }
         EmptyClipboard();
@@ -1139,16 +1151,17 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     })
 }
 
-/// The frame flashes to say it worked: nothing else on screen changes.
+/// Says how it went beside the cursor: nothing else on screen changes.
 fn copy_translation() {
     let text = UI.with(|ui| ui.patches.borrow().iter().filter(|p| !p.source.is_empty()).map(|p| p.text.clone()).collect::<Vec<_>>().join("\n"));
-    if !text.is_empty() && copy_to_clipboard(&text) {
-        UI.with(|ui| unsafe {
-            ui.flashing.set(true);
-            SetTimer(ui.main.get(), FLASH_TIMER, FLASH_MS, None);
-        });
-        update_frame();
-    }
+    let result = if text.is_empty() {
+        "コピーする訳文がありません"
+    } else if copy_to_clipboard(&text) {
+        "訳文をコピーしました"
+    } else {
+        "クリップボードが使えません"
+    };
+    toast::show(&t(result));
 }
 
 /// Stops everything for a while, keys included, for when they clash with what is on screen. A
@@ -1460,6 +1473,9 @@ fn register_hotkeys() -> bool {
     let mut mouse = Vec::new();
     let mut taken = Vec::new();
     for (index, (id, hotkey)) in ACTIONS.into_iter().zip(hotkeys).enumerate() {
+        if hotkey == config::Hotkey::OFF {
+            continue;
+        }
         if hotkey.is_mouse() {
             mouse.push((id, hotkey));
         } else if unsafe { RegisterHotKey(main, id, hotkey.mods | MOD_NOREPEAT, hotkey.key) } == 0 {
@@ -1473,7 +1489,7 @@ fn register_hotkeys() -> bool {
     all
 }
 
-/// The settings window needs the keys in use, to let them be typed into its boxes.
+/// Choosing a key in the settings needs the keys free, so that they can be typed.
 pub fn pause_hotkeys() {
     let main = UI.with(|ui| ui.main.get());
     for id in ACTIONS {
@@ -1483,6 +1499,7 @@ pub fn pause_hotkeys() {
 }
 
 pub fn resume_hotkeys() {
+    pause_hotkeys(); // registering a key twice would look like another app holding it
     register_hotkeys();
 }
 
@@ -1593,6 +1610,7 @@ fn main() {
         tray_icon(main, NIM_ADD);
         settings::register_class();
         bar::register_class();
+        toast::register_class();
         let overlay_handle = overlay as usize;
         std::thread::spawn(move || worker(overlay_handle));
         let hotkeys_ok = register_hotkeys();
