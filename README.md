@@ -8,7 +8,7 @@
 
 Windows 用の常駐アプリです。画面の好きな範囲を OCR して、文字を訳文に置き換えて見せます。翻訳先は日本語、やさしい日本語、英語、韓国語、中国語から選べます。Google 翻訳の画像翻訳のように、訳文を元の文字の位置に重ねて表示します。処理はすべて PC の中で完結します。
 
-**[sonoba-0.1.0.zip をダウンロード](https://github.com/paisu-supai/sonoba/releases/latest/download/sonoba-0.1.0.zip)**（Windows 11 用、64MB）。以前のバージョンと変更点は [Releases](https://github.com/paisu-supai/sonoba/releases) にあります。
+**[Sonoba をダウンロード（zip）](https://github.com/paisu-supai/sonoba/releases/latest/download/sonoba.zip)**（Windows 11 用、64MB、いつも最新版）。以前のバージョンと変更点は [Releases](https://github.com/paisu-supai/sonoba/releases) にあります。
 
 Built with PLaMo.
 

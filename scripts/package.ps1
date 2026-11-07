@@ -42,4 +42,6 @@ Copy-Item "$root\licenses" $stage -Recurse
 
 Copy-Item "$root\target\release\sonoba.exe", "$root\README.md", "$root\README.en.md", "$root\LICENSE", "$root\NOTICE.md" $stage
 Compress-Archive "$stage\*" "$dist\$name.zip" -Force
-Write-Host "dist\$name.zip  $([int]((Get-Item "$dist\$name.zip").Length / 1MB)) MB"
+# The README links releases/latest/download/sonoba.zip, so every release also carries this unversioned copy.
+Copy-Item "$dist\$name.zip" "$dist\sonoba.zip" -Force
+Write-Host "dist\$name.zip  $([int]((Get-Item "$dist\$name.zip").Length / 1MB)) MB (and dist\sonoba.zip for the release)"

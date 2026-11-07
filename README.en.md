@@ -10,7 +10,7 @@ This English version was translated from the Japanese README by PLaMo 3 Translat
 
 This is a tray app for Windows. It performs OCR on any area of the screen, replacing text with translations. You can choose from Japanese, easy Japanese, English, Korean, or Chinese as the target. Like Google Translate's image translation, it overlays the translation on top of the original text. All processing is completed entirely on your PC.
 
-**[Download sonoba-0.1.0.zip](https://github.com/paisu-supai/sonoba/releases/latest/download/sonoba-0.1.0.zip)** (for Windows 11, 64MB). Previous versions and update details are available in [Releases](https://github.com/paisu-supai/sonoba/releases).
+**[Download Sonoba (zip)](https://github.com/paisu-supai/sonoba/releases/latest/download/sonoba.zip)** (for Windows 11, 64MB, always the latest version). Previous versions and changes are in [Releases](https://github.com/paisu-supai/sonoba/releases).
 
 Built with PLaMo.
 
