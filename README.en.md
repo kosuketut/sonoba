@@ -62,7 +62,7 @@ Double-click the system tray icon to open Settings. The Settings screen is displ
 - Green border: Displays a thin line outside the translation region. For full-screen windows, it displays an inner line. You can also display a thick line for a brief moment when translation is complete. Both are disabled by default.
 - Translation font, bold, strength: Lowering the strength makes the original screen visible through.
 - History: A list of recent translations. Search and copy available. Stored only in memory and disappears when the app is closed. Can also be turned off.
-- Autostart: Starts when Windows boots. Disabled by default.
+- Autostart: Starts when Windows boots. Disabled by default. When enabled, it writes the exe location under the name `Sonoba` to the registry at `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and upon signing in, it starts while remaining resident in the system tray. No administrator privileges are required; it only affects your own account. Turning this off removes this value. When using the folder where the zip file was extracted, this is the only value written outside the folder. If you move the folder, turn it off and then back on again.
 - Display language: Japanese or English. Set to match Windows language the first time.
 
 The default "Auto" runs the portion in GPU memory on the GPU and the remainder on the CPU. If there is enough free space, everything runs on the GPU; on PCs without a GPU, it runs solely on the CPU. When GPU memory is low, switching to the lighter 0.8B option will make it run faster.
