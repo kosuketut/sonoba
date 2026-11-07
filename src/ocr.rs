@@ -303,6 +303,7 @@ pub fn paragraphs(lines: &[Line]) -> Vec<Block> {
                 }
                 block.text.push_str(&line.text);
                 let b = &mut block.glyphs;
+                b.picture |= g.picture;
                 let (right, bottom) = ((b.x + b.w).max(g.x + g.w), (b.y + b.h).max(g.y + g.h));
                 (b.x, b.y) = (b.x.min(g.x), b.y.min(g.y));
                 (b.w, b.h) = (right - b.x, bottom - b.y);
@@ -379,7 +380,7 @@ mod tests {
     use super::*;
 
     fn at(x: i32, y: i32, w: i32, h: i32, text: &str) -> Line {
-        Line { glyphs: Glyphs { x, y, w, h, bg: [0; 3], fg: [255; 3], stem: 2, icon: false }, text: text.into() }
+        Line { glyphs: Glyphs { x, y, w, h, bg: [0; 3], fg: [255; 3], stem: 2, icon: false, picture: false }, text: text.into() }
     }
 
     fn l(x: i32, y: i32, w: i32, text: &str) -> Line {
@@ -561,7 +562,7 @@ mod tests {
 
     #[test]
     fn wrapped_japanese_takes_no_space() {
-        let line = |y: i32, text: &str| Line { glyphs: Glyphs { x: 0, y, w: 400, h: 20, bg: [255; 3], fg: [0; 3], stem: 2, icon: false }, text: text.to_string() };
+        let line = |y: i32, text: &str| Line { glyphs: Glyphs { x: 0, y, w: 400, h: 20, bg: [255; 3], fg: [0; 3], stem: 2, icon: false, picture: false }, text: text.to_string() };
         let blocks = paragraphs(&[line(0, "取扱説明書をよく読んで、"), line(26, "正しく使ってください。")]);
         assert_eq!(blocks[0].text, "取扱説明書をよく読んで、正しく使ってください。");
     }

@@ -15,7 +15,7 @@ mod patch;
 mod settings;
 mod translate;
 
-use patch::{KEY_COLOR, Patch, WOBBLE_PERCENT};
+use patch::{Backdrop, KEY_COLOR, Patch, WOBBLE_PERCENT};
 use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -59,6 +59,7 @@ const FLASH_TIMER: usize = 1;
 const FLASH_MS: u32 = 450;
 const FRAME_PX: i32 = 2;
 const FLASH_PX: i32 = 4;
+const OUTLINE_EVERY_PX: i32 = 18; // of font size, for the outline of text on a picture
 const FRAME_COLOR: u32 = 0x0071CC2E; // green, as COLORREF
 const FLASH_COLOR: u32 = 0x0088FF39;
 const MENU_EXIT: usize = 1;
@@ -429,7 +430,10 @@ fn translate_frame(
     *shared.working.lock().unwrap() = (frame.to_vec(), everything);
     // Numbers, code and the like come back unchanged: leave the original on show.
     let patch = |block: &ocr::Block, text: &str| {
-        (text.to_lowercase() != block.text.to_lowercase()).then(|| Patch::new(frame, w, h, block, text.to_string()))
+        (text.to_lowercase() != block.text.to_lowercase()).then(|| {
+            let patch = Patch::new(frame, w, h, block, text.to_string());
+            if block.glyphs.picture && !live { patch.keep_picture(frame, w, h) } else { patch }
+        })
     };
     // Whatever is known already goes up with the first new line, so nothing flickers.
     let mut slots: Vec<Option<Patch>> = vec![None; blocks.len()];
@@ -1000,22 +1004,54 @@ unsafe fn fill(hdc: HDC, rect: &RECT, color: u32) {
     }
 }
 
+/// Black around light text and white around dark, whatever the picture does behind it.
+fn outline_color(fg: u32) -> u32 {
+    let (r, g, b) = (fg & 0xFF, fg >> 8 & 0xFF, fg >> 16 & 0xFF);
+    if r * 3 + g * 6 + b > 1275 { 0x00000000 } else { 0x00FFFFFF }
+}
+
+unsafe fn draw_backdrop(hdc: HDC, p: &Patch, b: &Backdrop) {
+    unsafe {
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = b.w;
+        info.bmiHeader.biHeight = -b.h; // top-down rows
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        SetDIBitsToDevice(hdc, p.x, p.y, b.w as u32, b.h as u32, 0, 0, 0, b.h as u32, b.bgra.as_ptr() as *const _, &info, DIB_RGB_COLORS);
+    }
+}
+
 unsafe fn draw_patches(hdc: HDC, patches: &[Patch]) {
     unsafe {
         SetBkMode(hdc, TRANSPARENT as i32);
         for p in patches {
-            fill(hdc, &RECT { left: p.x, top: p.y, right: p.x + p.w, bottom: p.y + p.h }, p.bg);
+            match &p.backdrop {
+                Some(b) => draw_backdrop(hdc, p, b),
+                None => fill(hdc, &RECT { left: p.x, top: p.y, right: p.x + p.w, bottom: p.y + p.h }, p.bg),
+            }
         }
         // A second pass, so no patch can paint over the text of the one before it.
         for p in patches {
             let font = text_font(p.px, p.bold);
             let old_font = SelectObject(hdc, font);
-            SetTextColor(hdc, p.fg);
             let top = p.y + (p.h - p.text_h) / 2;
             // DT_EDITCONTROL drops a last line that overhangs, so the box must hold all of it.
-            let mut area = RECT { left: p.x, top, right: p.x + p.w, bottom: top + p.text_h };
+            let area = RECT { left: p.x, top, right: p.x + p.w, bottom: top + p.text_h };
             let text = wide(&p.text);
-            DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut area, TEXT_FLAGS);
+            let write = |dx: i32, dy: i32, color: u32| {
+                let mut at = RECT { left: area.left + dx, top: area.top + dy, right: area.right + dx, bottom: area.bottom + dy };
+                SetTextColor(hdc, color);
+                DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut at, TEXT_FLAGS);
+            };
+            if p.backdrop.is_some() {
+                let reach = (p.px / OUTLINE_EVERY_PX).max(1);
+                let outline = outline_color(p.fg);
+                for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                    write(dx * reach, dy * reach, outline);
+                }
+            }
+            write(0, 0, p.fg);
             SelectObject(hdc, old_font);
             DeleteObject(font);
         }
@@ -1400,17 +1436,18 @@ mod tests {
         let (input, output) = (std::env::var("RENDER_IN").unwrap(), std::env::var("RENDER_OUT").unwrap());
         let (mut bgra, w, h) = ocr::png_bgra(&input);
         let region = Region { x: 0, y: 0, w: w as i32, h: h as i32 };
-        let job = Job { region, live: false, id: 1, window: 0 };
+        let live = std::env::var("RENDER_LIVE").is_ok(); // live jobs keep the flat box
+        let job = Job { region, live, id: 1, window: 0 };
         set_job(Some(job));
         let frame = Frame { pixels: bgra.clone(), w, h };
         let (mut models, mut translator) = (None, translate::Translator::new());
         let keep_going = || true;
         let shared = new_shared();
         let start = Instant::now();
-        let mut patches = translate_frame(&frame, false, &mut models, &mut translator, &keep_going, &|_| {}, &shared).unwrap();
+        let mut patches = translate_frame(&frame, live, &mut models, &mut translator, &keep_going, &|_| {}, &shared).unwrap();
         println!("first pass {:?}", start.elapsed());
         let start = Instant::now();
-        translate_frame(&frame, false, &mut models, &mut translator, &keep_going, &|_| {}, &shared).unwrap();
+        translate_frame(&frame, live, &mut models, &mut translator, &keep_going, &|_| {}, &shared).unwrap();
         println!("second pass, translations cached {:?}", start.elapsed());
         unsafe {
             let mem = CreateCompatibleDC(null_mut());

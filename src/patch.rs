@@ -3,6 +3,7 @@
 
 use crate::ocr::Block;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Overlay pixels of exactly this colour are see-through. COLORREF, as are `bg` and `fg`.
 pub const KEY_COLOR: u32 = 0x00FF00FF;
@@ -12,6 +13,8 @@ const GLYPH_STALE_PERCENT: usize = 30; // of the text's edges; compression noise
 pub const WOBBLE_PERCENT: usize = 2; // edges that change without the text changing, around a thin outline
 const EDGE_COLUMNS: usize = 2;
 const EDGE_PX: usize = 2; // a text edge rises within this many pixels, most of a video's do not
+const LETTER_FRINGE: usize = 2; // antialiasing around the letters goes with them
+const SMOOTHING: usize = 4; // passes over a painted-out letter, so that no outline of it shows
 const SAME_BG: i32 = 30;
 const SAME_FG: i32 = 80; // thin text rarely reaches its true colour, so allow for that
 const BOLD_STEM: usize = 8; // a stem wider than 1/8 of the line height, less one antialiased pixel
@@ -30,6 +33,7 @@ pub struct Glyphs {
     pub fg: [i32; 3],
     pub stem: usize, // median width of a stretch of ink: most rows cross vertical stems
     pub icon: bool,  // an icon sat before the text and was left out of this rectangle
+    pub picture: bool, // no common colour behind the text: a photo, a gradient, a video
 }
 
 impl Glyphs {
@@ -43,6 +47,14 @@ impl Glyphs {
     }
 }
 
+/// The picture behind a patch with the letters painted out, as BGRA rows.
+#[derive(Debug, PartialEq)]
+pub struct Backdrop {
+    pub w: i32,
+    pub h: i32,
+    pub bgra: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Patch {
     pub x: i32,
@@ -54,6 +66,7 @@ pub struct Patch {
     pub bg: u32,
     pub fg: u32,
     pub bold: bool,
+    pub backdrop: Option<Arc<Backdrop>>, // shown instead of the flat `bg`
     pub text: String,
     pub source: String, // what OCR read
     pub px: i32,     // font size, set when laid out on the UI thread
@@ -211,12 +224,67 @@ pub fn glyphs(bgra: &[u8], width: usize, height: usize, (x, y, w, h): (i32, i32,
     let mut seen = 0;
     let stem = runs.iter().position(|&n| { seen += n; seen > half }).unwrap_or(0);
     let (x, y) = (left as i32, top as i32);
-    Some(Glyphs { x, y, w: right as i32 + 1 - x, h: (bottom - top) as i32, bg, fg, stem, icon })
+    Some(Glyphs { x, y, w: right as i32 + 1 - x, h: (bottom - top) as i32, bg, fg, stem, icon, picture })
+}
+
+/// Takes the letters off a picture and leaves the rest of it. The rows just outside the box say
+/// what lies behind the text, and a pixel far from that is a letter.
+fn paint_out_letters(bgra: &[u8], width: usize, height: usize, (x, y, w, h): (usize, usize, usize, usize)) -> Backdrop {
+    let radius = h.max(8);
+    let smooth_row = |row: usize| -> Vec<[i32; 3]> {
+        (x..x + w)
+            .map(|col| {
+                let span = col.saturating_sub(radius)..(col + radius + 1).min(width);
+                let n = span.len() as i32;
+                let mut sum = [0; 3];
+                for p in span.map(|c| pixel(bgra, width, c, row)) {
+                    sum = [sum[0] + p[0], sum[1] + p[1], sum[2] + p[2]];
+                }
+                sum.map(|v| v / n)
+            })
+            .collect()
+    };
+    let (above, below) = (smooth_row(y.saturating_sub(1)), smooth_row((y + h).min(height - 1)));
+    let behind = |col: usize, row: usize| {
+        let (a, b) = (above[col], below[col]);
+        let (down, up) = (row as i32 + 1, (h - row) as i32);
+        [0, 1, 2].map(|c| (a[c] * up + b[c] * down) / (up + down))
+    };
+
+    let mut letter = vec![false; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            letter[row * w + col] = distance(pixel(bgra, width, x + col, y + row), behind(col, row)) > GLYPH_DISTANCE;
+        }
+    }
+    let grown: Vec<bool> = (0..w * h)
+        .map(|i| {
+            let (row, col) = (i / w, i % w);
+            let rows = row.saturating_sub(LETTER_FRINGE)..(row + LETTER_FRINGE + 1).min(h);
+            rows.flat_map(|r| (col.saturating_sub(LETTER_FRINGE)..(col + LETTER_FRINGE + 1).min(w)).map(move |c| r * w + c)).any(|j| letter[j])
+        })
+        .collect();
+
+    let mut out: Vec<[i32; 3]> = (0..w * h)
+        .map(|i| if grown[i] { behind(i % w, i / w) } else { pixel(bgra, width, x + i % w, y + i / w) })
+        .collect();
+    for _ in 0..SMOOTHING {
+        for i in (0..w * h).filter(|&i| grown[i]) {
+            let (row, col) = (i / w, i % w);
+            let around = [i.wrapping_sub(1).min(i - (col > 0) as usize), (i + (col + 1 < w) as usize), i - (row > 0) as usize * w, i + (row + 1 < h) as usize * w];
+            out[i] = [0, 1, 2].map(|c| around.iter().map(|&j| out[j][c]).sum::<i32>() / 4);
+        }
+    }
+    let mut pixels = Vec::with_capacity(w * h * 4);
+    for p in out {
+        // The overlay's see-through colour would punch a hole.
+        let g = if (p[2], p[1], p[0]) == (255, 0, 255) { 1 } else { p[1] as u8 };
+        pixels.extend([p[0] as u8, g, p[2] as u8, 255]);
+    }
+    Backdrop { w: w as i32, h: h as i32, bgra: pixels }
 }
 
 impl Patch {
-    // shortcut: a flat fill, so a photo or gradient behind the text shows as a solid box;
-    // inpaint from the surrounding pixels if that turns out to matter.
     pub fn new(bgra: &[u8], width: usize, height: usize, block: &Block, text: String) -> Self {
         let g = &block.glyphs;
         let x = (g.x - MARGIN).max(0);
@@ -229,7 +297,15 @@ impl Patch {
         let free = ((g.x + g.w) as usize..width).find(|&col| !empty(col)).unwrap_or(width) as i32;
         let max_w = if block.lines == 1 { (free - MARGIN - x).max(w) } else { w };
         let (bg, fg) = (colorref(g.bg), colorref(g.fg));
-        Self { x, y, w, max_w, h, em: block.em, bg, fg, bold: g.bold(), text, source: block.text.clone(), px: 0, text_h: 0 }
+        Self { x, y, w, max_w, h, em: block.em, bg, fg, bold: g.bold(), backdrop: None, text, source: block.text.clone(), px: 0, text_h: 0 }
+    }
+
+    /// On a still picture the text goes without the picture going with it. A video would move on
+    /// from whatever is painted here, so it keeps the flat box.
+    pub fn keep_picture(mut self, bgra: &[u8], width: usize, height: usize) -> Self {
+        let area = (self.x as usize, self.y as usize, self.w as usize, self.h as usize);
+        self.backdrop = Some(Arc::new(paint_out_letters(bgra, width, height, area)));
+        self
     }
 
     /// How much of the original text has gone, in percent. Only its sharpest edges count: a video
@@ -284,6 +360,7 @@ impl Patch {
             bg: STATUS_BG,
             fg: STATUS_FG,
             bold: false,
+            backdrop: None,
             text: text.to_string(),
             source: String::new(),
             px: 0,
@@ -459,7 +536,7 @@ mod tests {
 
     #[test]
     fn style_separates_a_code_block_from_the_page() {
-        let at = |bg, fg| Glyphs { x: 0, y: 0, w: 1, h: 1, bg, fg, stem: 1, icon: false };
+        let at = |bg, fg| Glyphs { x: 0, y: 0, w: 1, h: 1, bg, fg, stem: 1, icon: false, picture: false };
         let page = at([0, 0, 0], [236, 236, 236]);
         assert!(page.same_style(&at([1, 0, 0], [220, 230, 236])));
         assert!(!page.same_style(&at([35, 31, 27], [236, 236, 236])));
@@ -513,6 +590,37 @@ mod tests {
         let g = glyphs(&img, w, h, (0, 0, w as i32, h as i32), None).unwrap();
         assert!(g.y <= 12 && g.y + g.h >= 48, "{} {}", g.y, g.h);
         assert!(g.bg.iter().sum::<i32>() < 3 * 170 && g.fg == [255, 255, 255], "{:?} {:?}", g.bg, g.fg);
+    }
+
+    #[test]
+    fn letters_come_off_a_picture_and_the_picture_stays() {
+        let (w, h) = (300usize, 60usize);
+        let mut img = canvas(w, h, WHITE);
+        for y in 0..h {
+            for x in 0..w {
+                let (v, grain) = ((40 + x / 4 + y) as u8, (x % 5 * 2) as u8);
+                img[(y * w + x) * 4..][..3].copy_from_slice(&[v + grain, v + 10 + grain, v + 20 + grain]);
+            }
+        }
+        let before = img.clone();
+        for left in (20..270).step_by(16) {
+            paint(&mut img, w, (left, 20, left + 6, 40), WHITE, 1);
+        }
+        let b = paint_out_letters(&img, w, h, (10, 16, 280, 28));
+        let at = |x: usize, y: usize| pixel(&b.bgra, 280, x - 10, y - 16);
+        assert!(distance(at(22, 30), pixel(&before, w, 22, 30)) < 30, "{:?}", at(22, 30));
+        assert_eq!(at(32, 30), pixel(&before, w, 32, 30), "between the letters nothing changes");
+    }
+
+    #[test]
+    fn the_see_through_colour_never_comes_out_of_a_picture() {
+        let (w, h) = (40usize, 20usize);
+        let mut img = canvas(w, h, WHITE);
+        for p in img.chunks_mut(4) {
+            p.copy_from_slice(&[255, 0, 255, 255]);
+        }
+        let b = paint_out_letters(&img, w, h, (5, 5, 20, 10));
+        assert!(b.bgra.chunks(4).all(|p| p[..3] != [255, 0, 255]));
     }
 
     #[test]
