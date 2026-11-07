@@ -4,7 +4,7 @@ use crate::engine::{self, Device, Options};
 use crate::models;
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 const MOD_ALT: u32 = 1;
 const MOD_CONTROL: u32 = 2;
@@ -23,6 +23,8 @@ pub struct Config {
     pub gpu_limit_mib: Option<u64>, // None: whatever fits
     pub show_frame: bool, // a thin frame around the region while a job runs
     pub flash_frame: bool, // the frame for a moment whenever a translation finishes
+    pub source: String, // what to read: "auto", "ja" (translate Japanese too) or "ko"
+    pub target: String, // a language code of the model, "ja(easy)" included
     pub hotkeys: [Hotkey; 3], // one shot, live, clear
 }
 
@@ -36,6 +38,8 @@ impl Default for Config {
             gpu_limit_mib: None,
             show_frame: false,
             flash_frame: false,
+            source: "auto".to_string(),
+            target: "ja".to_string(),
             hotkeys: [ctrl_alt('T'), ctrl_alt('R'), ctrl_alt('X')],
         }
     }
@@ -58,6 +62,12 @@ impl Config {
         config.gpu_limit_mib = saved["gpu_limit_mib"].as_u64();
         config.show_frame = saved["show_frame"].as_bool().unwrap_or(false);
         config.flash_frame = saved["flash_frame"].as_bool().unwrap_or(false);
+        if let Some(source) = saved["source"].as_str() {
+            config.source = source.to_string();
+        }
+        if let Some(target) = saved["target"].as_str() {
+            config.target = target.to_string();
+        }
         for (slot, name) in config.hotkeys.iter_mut().zip(["once", "live", "clear"]) {
             if let (Some(mods), Some(key)) = (saved[name]["mods"].as_u64(), saved[name]["key"].as_u64()) {
                 *slot = Hotkey { mods: mods as u32, key: key as u32 };
@@ -80,6 +90,8 @@ impl Config {
             "gpu_limit_mib": self.gpu_limit_mib,
             "show_frame": self.show_frame,
             "flash_frame": self.flash_frame,
+            "source": self.source,
+            "target": self.target,
             "once": hotkey(&self.hotkeys[0]),
             "live": hotkey(&self.hotkeys[1]),
             "clear": hotkey(&self.hotkeys[2]),
@@ -96,8 +108,23 @@ impl Config {
     }
 }
 
+/// A copy unpacked from the zip keeps everything in its `data` folder, so that deleting the folder
+/// removes the app. Where it cannot write there (Program Files), the user's profile is used.
+pub fn portable_dir() -> Option<&'static PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::current_exe().ok()?.parent()?.join("data");
+        let probe = dir.join(".write-test");
+        std::fs::write(&probe, "").ok()?;
+        let _ = std::fs::remove_file(probe);
+        Some(dir)
+    })
+    .as_ref()
+}
+
 fn path() -> PathBuf {
-    PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("screen-translate\\config.json")
+    let profile = || PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("screen-translate");
+    portable_dir().cloned().unwrap_or_else(profile).join("config.json")
 }
 
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
@@ -130,6 +157,8 @@ mod tests {
         config.gpu_limit_mib = Some(1536);
         config.show_frame = true;
         config.flash_frame = true;
+        config.source = "ko".into();
+        config.target = "ja(easy)".into();
         config.hotkeys[1] = Hotkey { mods: 6, key: 0x70 };
         assert_eq!(Config::parse(&config.to_json()), config);
     }

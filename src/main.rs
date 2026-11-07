@@ -173,9 +173,10 @@ fn worker(overlay: usize) {
 
 /// Loads the OCR models, or reloads them if the thread setting has changed.
 fn ensure_ocr(models: &mut Option<ocr::Ocr>) -> Result<(), String> {
-    let threads = config::get().threads();
-    if models.as_ref().is_none_or(|m| m.threads() != threads) {
-        *models = Some(ocr::Ocr::new(threads)?);
+    let config = config::get();
+    let (threads, korean) = (config.threads(), config.source == "ko");
+    if !models.as_ref().is_some_and(|m| m.matches(threads, korean)) {
+        *models = Some(ocr::Ocr::new(threads, korean)?);
     }
     Ok(())
 }
@@ -417,6 +418,7 @@ fn translate_frame(
     shared: &Shared,
 ) -> Result<Vec<Patch>, String> {
     ensure_ocr(models)?;
+    translator.follow_languages();
     let Frame { pixels, w, h } = frame;
     let (w, h) = (*w, *h);
     let frame = pixels.as_slice();

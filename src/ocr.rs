@@ -10,6 +10,8 @@ use std::sync::Arc;
 static DET: &[u8] = include_bytes!("../models/PP-OCRv6_det_small.onnx");
 static REC: &[u8] = include_bytes!("../models/PP-OCRv6_rec_small.onnx");
 static DICT: &str = include_str!("../models/dict.txt");
+static REC_KOREAN: &[u8] = include_bytes!("../models/korean_PP-OCRv5_mobile_rec.onnx");
+static DICT_KOREAN: &str = include_str!("../models/dict_korean.txt");
 
 // shortcut: long sides above this are scaled down, so a whole 4K screen of small text
 // reads poorly; tile the image if full-screen regions turn out to matter.
@@ -92,20 +94,23 @@ pub struct Ocr {
     chars: Vec<&'static str>,
     pool: Arc<ThreadPool>,
     threads: usize,
+    korean: bool,
 }
 
 impl Ocr {
-    pub fn new(threads: usize) -> Result<Self, String> {
+    /// PP-OCRv6 reads Chinese, English, Japanese and Latin scripts; Hangul takes a model of its own.
+    pub fn new(threads: usize, korean: bool) -> Result<Self, String> {
         let load = |b| Model::load_static_slice(b).map_err(|e| e.to_string());
+        let (rec, dict) = if korean { (REC_KOREAN, DICT_KOREAN) } else { (REC, DICT) };
         let mut chars = vec![""]; // class 0 is the CTC blank
-        chars.extend(DICT.lines().filter(|s| !s.is_empty())); // git may check dict.txt out as CRLF
+        chars.extend(dict.lines().filter(|s| !s.is_empty())); // git may check dict.txt out as CRLF
         chars.push(" ");
         let pool = Arc::new(ThreadPool::with_num_threads(threads));
-        Ok(Self { det: load(DET)?, rec: load(REC)?, chars, pool, threads })
+        Ok(Self { det: load(DET)?, rec: load(rec)?, chars, pool, threads, korean })
     }
 
-    pub fn threads(&self) -> usize {
-        self.threads
+    pub fn matches(&self, threads: usize, korean: bool) -> bool {
+        self.threads == threads && self.korean == korean
     }
 
     fn run_options(&self) -> Option<RunOptions> {
@@ -293,7 +298,7 @@ pub fn paragraphs(lines: &[Line]) -> Vec<Block> {
                 let hyphen = block.text.ends_with('-') && line.text.starts_with(|c: char| c.is_lowercase());
                 if hyphen {
                     block.text.pop();
-                } else {
+                } else if !(block.text.ends_with(is_cjk) && line.text.starts_with(is_cjk)) {
                     block.text.push(' ');
                 }
                 block.text.push_str(&line.text);
@@ -313,6 +318,11 @@ pub fn paragraphs(lines: &[Line]) -> Vec<Block> {
         prev = Some(line);
     }
     out
+}
+
+/// Japanese and Chinese wrap anywhere, with no space to put back.
+fn is_cjk(c: char) -> bool {
+    matches!(c, '\u{3000}'..='\u{30FF}' | '\u{4E00}'..='\u{9FFF}' | '\u{FF00}'..='\u{FFEF}')
 }
 
 /// Code stays as it is: the model would otherwise paraphrase it. Prose rarely spends one
@@ -335,6 +345,10 @@ fn continues(line_a: &Line, line_b: &Line, para_right: i32) -> bool {
     }
     if line_b.text.starts_with(|c: char| c.is_lowercase()) {
         return true;
+    }
+    // Japanese has no words to go by: a line that ran to the right edge was wrapped.
+    if line_a.text.ends_with(is_cjk) && line_b.text.starts_with(is_cjk) {
+        return a.x + a.w + h > para_right.max(b.x + b.w);
     }
     if line_a.text.split(' ').count() < 4 {
         return false; // menu items and labels, not wrapped prose
@@ -457,7 +471,7 @@ mod tests {
     /// Boxes are taller than the glyphs, so a blank line looks smaller than a line height.
     #[test]
     fn blank_line_separates_paragraphs() {
-        let ocr = Ocr::new(4).unwrap();
+        let ocr = Ocr::new(4, false).unwrap();
         let (bgra, w, h) = png_bgra("testdata/paragraphs.png");
         let lines = ocr.read(&bgra, w, h).unwrap();
         let got = paragraphs(&lines);
@@ -467,7 +481,7 @@ mod tests {
 
     #[test]
     fn bold_is_recognised_at_heading_and_body_sizes() {
-        let ocr = Ocr::new(4).unwrap();
+        let ocr = Ocr::new(4, false).unwrap();
         let (bgra, w, h) = png_bgra("testdata/weights.png");
         let blocks = paragraphs(&ocr.read(&bgra, w, h).unwrap());
         let got: Vec<_> = blocks
@@ -489,7 +503,7 @@ mod tests {
     /// Video frames are noisy, and once brought the seam search down to a line of no height.
     #[test]
     fn noisy_frames_never_panic() {
-        let ocr = Ocr::new(4).unwrap();
+        let ocr = Ocr::new(4, false).unwrap();
         let (clean, w, h) = png_bgra("testdata/paragraphs.png");
         let mut seed = 0x2545F4914F6CDD1Du64;
         let mut next = move || {
@@ -524,7 +538,7 @@ mod tests {
         const WANT: &str = "The quick update changes how background tasks are scheduled. If your session expires, \
             you'll need to sign in again before saving. Don't close this window until the upload has finished, \
             otherwise the file may be incomplete.";
-        let ocr = Ocr::new(4).unwrap();
+        let ocr = Ocr::new(4, false).unwrap();
         for name in ["dark-14px", "game-22px", "mono-13px", "ui-12px", "ui-14px", "web-16px"] {
             let (bgra, w, h) = png_bgra(&format!("testdata/{name}.png"));
             let start = std::time::Instant::now();
@@ -534,5 +548,21 @@ mod tests {
             println!("{name}: {elapsed:?} {got}");
             assert_eq!(got, WANT, "{name}");
         }
+    }
+
+    #[test]
+    fn reads_hangul_with_its_own_model() {
+        let (bgra, w, h) = png_bgra("testdata/korean.png");
+        let lines = Ocr::new(4, true).unwrap().read(&bgra, w, h).unwrap();
+        let got = paragraphs(&lines).iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" / ");
+        println!("{got}");
+        assert!(got.contains("화면의 글자를 번역합니다") && got.contains("언어를 바꿀 수 있습니다"), "{got}");
+    }
+
+    #[test]
+    fn wrapped_japanese_takes_no_space() {
+        let line = |y: i32, text: &str| Line { glyphs: Glyphs { x: 0, y, w: 400, h: 20, bg: [255; 3], fg: [0; 3], stem: 2, icon: false }, text: text.to_string() };
+        let blocks = paragraphs(&[line(0, "取扱説明書をよく読んで、"), line(26, "正しく使ってください。")]);
+        assert_eq!(blocks[0].text, "取扱説明書をよく読んで、正しく使ってください。");
     }
 }

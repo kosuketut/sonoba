@@ -15,7 +15,8 @@ cargo build --release --manifest-path "$root\Cargo.toml"
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force "$stage\engine" | Out-Null
+New-Item -ItemType Directory -Force "$stage\engine", "$stage\data" | Out-Null
+Set-Content "$stage\data\README.txt" -Encoding utf8 -Value 'Settings and models live here. Delete the whole app folder to remove the app.'
 $zip = "$dist\$asset"
 if (-not (Test-Path $zip)) {
     Invoke-WebRequest "https://github.com/ggml-org/llama.cpp/releases/download/$tag/$asset" -OutFile $zip
