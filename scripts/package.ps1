@@ -39,6 +39,7 @@ foreach ($file in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
 
 & "$PSScriptRoot\licenses.ps1"
 Copy-Item "$root\licenses" $stage -Recurse
+Remove-Item "$stage\licenses\objc2.txt" # for the Mac build only
 
 Copy-Item "$root\target\release\sonoba.exe", "$root\README.md", "$root\README.en.md", "$root\LICENSE", "$root\NOTICE.md" $stage
 Compress-Archive "$stage\*" "$dist\$name.zip" -Force

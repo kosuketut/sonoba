@@ -75,7 +75,13 @@ impl Translator {
         self.engine = None; // first, so that the port is free again
         let model = models::path(&wanted.0);
         if !model.exists() {
-            return Err("モデルがありません。トレイのアイコンから設定を開いてダウンロードしてください".to_string());
+            // The icon is in the tray on Windows and in the menu bar on a Mac.
+            let message = if cfg!(target_os = "macos") {
+                "モデルがありません。メニューバーのアイコンから設定を開いてダウンロードしてください"
+            } else {
+                "モデルがありません。トレイのアイコンから設定を開いてダウンロードしてください"
+            };
+            return Err(message.to_string());
         }
         if self.running.as_ref().is_some_and(|(file, _)| *file != wanted.0) {
             self.cache.lock().unwrap().clear(); // another model, other translations
