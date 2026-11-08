@@ -2,13 +2,11 @@
 
 use crate::i18n::t;
 use serde_json::Value;
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
-use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 pub const DEFAULT: &str = "plamo-3-translate-2b-Q4_K_M.gguf";
 const CATALOG: [(&str, &str); 4] = [("0.8b", "軽量、0.6GB"), ("2b", "標準、1.8GB"), ("8b", "高品質、5.3GB"), ("31b", "最高品質、19.5GB")];
@@ -96,8 +94,8 @@ pub fn delete(file: &str) -> std::io::Result<()> {
 }
 
 fn tool(name: &str) -> Command {
-    let mut command = Command::new(name); // curl and certutil come with Windows
-    command.stdin(Stdio::null()).stderr(Stdio::null()).creation_flags(CREATE_NO_WINDOW);
+    let mut command = Command::new(name); // curl comes with Windows and macOS, and so do certutil and shasum
+    crate::engine::quiet(command.stdin(Stdio::null()).stderr(Stdio::null()));
     command
 }
 
@@ -113,10 +111,14 @@ fn expected(repo: &str, file: &str) -> Result<(u64, String), String> {
 }
 
 fn sha256(file: &PathBuf) -> Result<String, String> {
+    #[cfg(windows)]
     let output = tool("certutil").arg("-hashfile").arg(file).arg("SHA256").output().map_err(|e| e.to_string())?;
+    #[cfg(not(windows))]
+    let output = tool("/usr/bin/shasum").args(["-a", "256"]).arg(file).output().map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&output.stdout);
     let is_hash = |line: &&str| line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit());
-    text.lines().map(str::trim).find(is_hash).map(str::to_lowercase).ok_or_else(|| "ハッシュを計算できません".to_string())
+    // certutil puts the hash on a line of its own, shasum before the file name.
+    text.lines().filter_map(|line| line.split_whitespace().next()).find(is_hash).map(str::to_lowercase).ok_or_else(|| "ハッシュを計算できません".to_string())
 }
 
 fn download(file: &str) -> Result<(), String> {

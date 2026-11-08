@@ -19,7 +19,7 @@
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
 body {
-  font: 14px/1.55 "Segoe UI Variable Text", "Segoe UI", "Yu Gothic UI", "Malgun Gothic", sans-serif;
+  font: 14px/1.55 "Segoe UI Variable Text", "Segoe UI", "Yu Gothic UI", -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Malgun Gothic", sans-serif;
   color: var(--text); background: var(--bg); display: flex; overflow: hidden; user-select: none;
 }
 nav { width: 188px; flex: none; background: var(--side); padding: 20px 10px; display: flex; flex-direction: column; gap: 2px; }
@@ -371,12 +371,28 @@ const TEXT = {
     back: 'Cancel', ask_delete: 'Delete model', del_again: 'To use it again you will need to download it again.', del_gone: 'This file skips the Recycle Bin and cannot be restored.', del_yes: 'Delete', ask_delete_q: ': delete this file?'
   }
 };
+// What differs on a Mac: its names for keys, places and starting up.
+const MAC_TEXT = {
+  ja: {
+    key_note: 'Control・Option・Command のどれかを含むキー、またはマウスの中ボタンとサイドボタンを押します。esc で取り消せます。', key_bad: 'Control・Option・Command のどれかを含めてください',
+    font_default: '標準（ヒラギノ角ゴシック）', autostart: 'ログイン時に開始する', autostart_note: 'アプリを移動したら入れ直してください',
+    hello_note: '画面の文字を、その場で訳文に置き換えます。翻訳はこの Mac の中で完結します。表示の言語を選んでください。',
+    del_gone: 'このファイルはゴミ箱に入らず、元に戻せません。'
+  },
+  en: {
+    key_note: 'Press a combination with Control, Option or Command, or the middle or a side mouse button. Esc cancels.', key_bad: 'Include Control, Option or Command',
+    font_default: 'Default (Hiragino Sans)', autostart: 'Start at login', autostart_note: 'Turn this on again after moving the app',
+    hello_note: 'Replaces the text on your screen with its translation, right where it is. Translation stays on this Mac. Choose your language.',
+    del_gone: 'This file skips the Trash and cannot be restored.'
+  }
+};
 const LICENSE = { ja: 'https://plamo.preferredai.jp/info/plamo-community-license-ja', en: 'https://plamo.preferredai.jp/info/plamo-community-license-en' };
 const GPU_LIMITS = [null, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192];
 const $ = id => document.getElementById(id);
 const post = m => chrome.webview.postMessage(m);
 let state = null, page = 'translate', waiting = -1, step = 0, introOpen = false, pending = null;
-const T = key => TEXT[state?.ui_lang === 'en' ? 'en' : 'ja'][key] ?? key;
+const isMac = () => state?.platform === 'mac';
+const T = key => { const lang = state?.ui_lang === 'en' ? 'en' : 'ja'; return (isMac() && MAC_TEXT[lang][key]) || (TEXT[lang][key] ?? key); };
 
 function options(select, list, value) {
   const wanted = list.map(o => o[0] + '\u0000' + o[1]).join('\u0001');
@@ -402,7 +418,14 @@ function keyName(v) {
   return { 0x20: 'Space', 0x09: 'Tab', 0x0D: 'Enter', 0x08: 'Backspace', 0x2D: 'Insert', 0x2E: 'Delete', 0x24: 'Home', 0x23: 'End', 0x21: 'PageUp', 0x22: 'PageDown',
     0x25: '←', 0x26: '↑', 0x27: '→', 0x28: '↓', 0xBA: ':', 0xBB: ';', 0xBC: ',', 0xBD: '-', 0xBE: '.', 0xBF: '/', 0xC0: '@', 0xDB: '[', 0xDC: '¥', 0xDD: ']', 0xDE: '^', 0xE2: '\\' }[v] ?? 'VK ' + v.toString(16);
 }
-const hotkey = h => !h.key ? T('key_none') : [h.mods & 2 && 'Ctrl', h.mods & 1 && 'Alt', h.mods & 4 && 'Shift', keyName(h.key)].filter(Boolean).join(' + ');
+const macKeys = { 0x0D: 'Return', 0x08: 'Delete', 0x2E: '⌦', 0x1B: 'esc' };
+// A Mac writes the modifiers as symbols in front of the key, in this order.
+const macHotkey = h => {
+  const mods = [h.mods & 2 && '⌃', h.mods & 1 && '⌥', h.mods & 4 && '⇧', h.mods & 8 && '⌘'].filter(Boolean).join('');
+  return mods + (mods && h.key <= 6 ? ' ' : '') + (macKeys[h.key] ?? keyName(h.key)); // a mouse button is a word
+};
+const hotkey = h => !h.key ? T('key_none') : isMac() ? macHotkey(h) : [h.mods & 2 && 'Ctrl', h.mods & 1 && 'Alt', h.mods & 4 && 'Shift', keyName(h.key)].filter(Boolean).join(' + ');
+const modsOf = e => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 4 : 0) | (isMac() && e.metaKey ? 8 : 0);
 function statusOf(s) {
   const m = s.models.find(x => x.file === s.model);
   if (!m) return '';
@@ -582,9 +605,9 @@ addEventListener('keydown', e => {
   if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) return;
   const index = waiting;
   if (e.key === 'Escape') return choosing(-1);
-  if (!e.ctrlKey && !e.altKey) { choosing(-1); state.message = T('key_bad'); return render(state); }
+  if (!e.ctrlKey && !e.altKey && !(isMac() && e.metaKey)) { choosing(-1); state.message = T('key_bad'); return render(state); }
   waiting = -1;
-  post({ cmd: 'hotkey', index, mods: (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 4 : 0), key: e.keyCode });
+  post({ cmd: 'hotkey', index, mods: modsOf(e), key: e.keyCode });
 }, true);
 addEventListener('keyup', e => { if (waiting >= 0) e.preventDefault(); }, true);
 addEventListener('mousedown', e => {
@@ -594,7 +617,7 @@ addEventListener('mousedown', e => {
   e.preventDefault(); e.stopPropagation();
   const index = waiting;
   waiting = -1;
-  post({ cmd: 'hotkey', index, mods: (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 4 : 0), key });
+  post({ cmd: 'hotkey', index, mods: modsOf(e), key });
 }, true);
 for (const b of document.querySelectorAll('[data-lang]')) b.onclick = () => send('ui_lang', b.dataset.lang);
 function go(n) { step = n; renderIntro(state, state.models.find(x => x.file === state.model) ?? {}, state.progress >= 0); }

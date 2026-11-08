@@ -19,6 +19,7 @@ const SAME_BG: i32 = 30;
 const SAME_FG: i32 = 80; // thin text rarely reaches its true colour, so allow for that
 const BOLD_STEM: usize = 8; // a stem wider than 1/8 of the line height, less one antialiased pixel
 const MIN_BOLD_LINE: i32 = 16; // small text is all antialiasing, so weight cannot be told
+const MIN_TEXT_PX: i32 = 9; // below this Japanese stops being legible; the patch grows instead
 const STATUS_BG: u32 = 0x00201C1C;
 const STATUS_FG: u32 = 0x00F5F5F5;
 
@@ -348,6 +349,34 @@ impl Patch {
         self.changed_percent(frame, basis, width) > GLYPH_STALE_PERCENT
     }
 
+    /// Keeps the original font size if the text fits, spreading one line over empty background
+    /// first and shrinking only after that. Overhanging leading is empty, so it does not count,
+    /// and the patch grows only when even MIN_TEXT_PX does not fit. `measure` takes a font size
+    /// and a width to wrap at, and gives the width and height the text then takes.
+    pub fn fit(&mut self, status_px: i32, measure: impl Fn(i32, i32) -> (i32, i32)) {
+        let status = self.h == 0;
+        let mut px = if status { status_px } else { self.em.max(1) };
+        let smallest = MIN_TEXT_PX.min(px);
+        let ((right, bottom), width) = loop {
+            let room = self.h + px / 2;
+            let normal = measure(px, self.w);
+            if normal.1 <= room {
+                break (normal, self.w);
+            }
+            let spread = measure(px, self.max_w);
+            if spread.1 <= room {
+                break (spread, self.w.max(spread.0 + 1));
+            }
+            if status || px <= smallest {
+                self.h = normal.1;
+                break (normal, self.w);
+            }
+            px -= 1;
+        };
+        (self.px, self.text_h) = (px, bottom);
+        self.w = if status { right } else { width };
+    }
+
     /// A message in the region's top left corner, sized to its text.
     pub fn status(text: &str, width: i32) -> Self {
         Self {
@@ -367,6 +396,12 @@ impl Patch {
             text_h: 0,
         }
     }
+}
+
+/// Black around light text and white around dark, whatever the picture does behind it.
+pub fn outline_color(fg: u32) -> u32 {
+    let (r, g, b) = (fg & 0xFF, fg >> 8 & 0xFF, fg >> 16 & 0xFF);
+    if r * 3 + g * 6 + b > 1275 { 0x00000000 } else { 0x00FFFFFF }
 }
 
 fn colorref([b, g, r]: [i32; 3]) -> u32 {

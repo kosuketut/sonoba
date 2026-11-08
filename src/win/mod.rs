@@ -1,0 +1,1311 @@
+//! Screen OCR and English to Japanese translation, driven by global hotkeys.
+//!
+//! No window here ever takes the keyboard focus: the selection layer and the overlay are
+//! WS_EX_NOACTIVATE and Esc is a hotkey, so the active window stays active throughout.
+//! The overlay also lets the mouse through, and capture skips it, so OCR keeps seeing the
+//! original text underneath the translation.
+
+mod bar;
+mod capture;
+mod settings_window;
+mod toast;
+
+pub use capture::Grabber;
+pub use settings_window::{autostart, close_settings, fonts, open_link, post_to_page, set_autostart};
+
+use crate::i18n::t;
+use crate::job::*;
+use crate::patch::{self, Backdrop, KEY_COLOR, Patch};
+use crate::{config, models};
+use std::cell::{Cell, RefCell};
+use std::ptr::{null, null_mut};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Dwm::*;
+use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows_sys::Win32::UI::HiDpi::*;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+use windows_sys::Win32::UI::Shell::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+use windows_sys::w;
+
+const MIN_SELECTION: i32 = 8;
+const STATUS_PX: i32 = 16;
+const DEFAULT_FONT: &str = "Yu Gothic UI";
+
+const HK_ONCE: i32 = 1;
+const HK_LIVE: i32 = 2;
+const HK_STOP: i32 = 3;
+const HK_ESC: i32 = 4;
+const HK_PEEK: i32 = 6;
+const HK_COPY: i32 = 7;
+const ACTIONS: [i32; config::ACTIONS] = [HK_ONCE, HK_LIVE, HK_STOP, HK_PEEK, HK_COPY];
+const ESSENTIAL_ACTIONS: usize = 3; // the app is no use without these
+const WM_PATCHES: u32 = WM_APP + 1;
+const WM_TRAY: u32 = WM_APP + 2;
+const WM_JOB_OVER: u32 = WM_APP + 3;
+const WM_PEEK_END: u32 = WM_APP + 9;
+const WM_PARTS: u32 = WM_APP + 10;
+const WM_TRANSLATED: u32 = WM_APP + 4;
+const FLASH_TIMER: usize = 1;
+const FLASH_MS: u32 = 450;
+const PEEK_TIMER: usize = 2;
+const PEEK_MS: u32 = 30;
+const CLIPBOARD_TRIES: usize = 25;
+const CLIPBOARD_WAIT: Duration = Duration::from_millis(20);
+const FRAME_PX: i32 = 2;
+const FLASH_PX: i32 = 4;
+const OUTLINE_EVERY_PX: i32 = 18; // of font size, for the outline of text on a picture
+const FRAME_COLOR: u32 = 0x0071CC2E; // green, as COLORREF
+const FLASH_COLOR: u32 = 0x0088FF39;
+const MENU_EXIT: usize = 1;
+const MENU_SETTINGS: usize = 2;
+const MENU_PAUSE: usize = 3;
+const HK_PROBE: i32 = 5;
+
+pub const CAPTURE_FAILED: &str = "画面を取得できません";
+
+/// The overlay, for the worker's messages to the UI thread.
+static OVERLAY: AtomicUsize = AtomicUsize::new(0);
+
+fn post(msg: u32, id: u64, data: isize) {
+    unsafe { PostMessageW(OVERLAY.load(Ordering::Relaxed) as HWND, msg, id as usize, data) };
+}
+
+pub fn post_patches(id: u64, patches: Vec<Patch>) {
+    post(WM_PATCHES, id, Box::into_raw(Box::new(patches)) as isize);
+}
+
+pub fn post_translated(id: u64) {
+    post(WM_TRANSLATED, id, 0);
+}
+
+pub fn post_job_over(id: u64) {
+    post(WM_JOB_OVER, id, 0);
+}
+
+pub fn post_parts(id: u64) {
+    post(WM_PARTS, id, 0);
+}
+
+/// Screenshots see the overlay unless this is on; OCR must never see it.
+pub fn hide_overlay_from_capture(hidden: bool) {
+    let affinity = if hidden { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    unsafe { SetWindowDisplayAffinity(OVERLAY.load(Ordering::Relaxed) as HWND, affinity) };
+}
+
+/// Closed, hidden, or on another virtual desktop, which is what a cloaked window is.
+pub fn window_is_gone(window: usize) -> bool {
+    let window = window as HWND;
+    unsafe {
+        let mut cloaked: u32 = 0;
+        DwmGetWindowAttribute(window, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as *mut _, 4);
+        IsWindow(window) == 0 || (IsWindowVisible(window) == 0 && IsIconic(window) == 0) || cloaked != 0
+    }
+}
+
+/// Japanese on a Japanese Windows, English on any other.
+pub fn system_language() -> &'static str {
+    const PRIMARY: u16 = 0x3FF;
+    const JAPANESE: u16 = 0x11;
+    if unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() } & PRIMARY == JAPANESE { "ja" } else { "en" }
+}
+
+const DIM_ALPHA: u8 = 110;
+const HOVER_FRAME: i32 = 4;
+const HOVER_COLOR: u32 = 0x00FFFFFF;
+
+/// How a region hangs on the window under it, so that it can go wherever the window goes.
+#[derive(Clone, Copy)]
+struct Anchor {
+    window: HWND,
+    whole: bool, // the region is the window itself; otherwise a part at (dx, dy) from its corner
+    dx: i32,
+    dy: i32,
+}
+
+static MOUSE_KEYS: Mutex<Vec<(i32, config::Hotkey)>> = Mutex::new(Vec::new());
+pub static TAKEN_KEYS: Mutex<Vec<usize>> = Mutex::new(Vec::new()); // actions another app holds the key of
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+// --- UI thread state. Cells only: window procedures re-enter while Win32 calls run.
+
+struct Ui {
+    main: Cell<HWND>,
+    overlay: Cell<HWND>,
+    frame: Cell<HWND>,
+    selecting: Cell<Option<Region>>, // the drag so far, in screen pixels
+    peeking: Cell<bool>, // the original is on show while a key is held
+    shift_seen: Cell<bool>, // Shift was down during the drag in progress
+    resume: Cell<Option<Region>>, // the live job to start again after a pause
+    mouse_hook: Cell<HHOOK>,
+    flashing: Cell<bool>,
+    select: Cell<HWND>,
+    drag_from: Cell<Option<(i32, i32)>>,
+    drag_to: Cell<(i32, i32)>,
+    hover: Cell<Option<(i32, i32, i32, i32)>>, // the window a click would select, in client pixels
+    hover_window: Cell<HWND>,
+    region: Cell<Region>,
+    anchor: Cell<Option<Anchor>>,
+    hook: Cell<HWINEVENTHOOK>,
+    job_id: Cell<u64>, // results from older jobs are dropped
+    live: Cell<bool>,
+    patches: RefCell<Vec<Patch>>,
+}
+
+thread_local! {
+    static UI: Ui = Ui {
+        main: Cell::new(null_mut()),
+        overlay: Cell::new(null_mut()),
+        frame: Cell::new(null_mut()),
+        selecting: Cell::new(None),
+        peeking: Cell::new(false),
+        shift_seen: Cell::new(false),
+        resume: Cell::new(None),
+        mouse_hook: Cell::new(null_mut()),
+        flashing: Cell::new(false),
+        select: Cell::new(null_mut()),
+        drag_from: Cell::new(None),
+        drag_to: Cell::new((0, 0)),
+        hover: Cell::new(None),
+        hover_window: Cell::new(null_mut()),
+        region: Cell::new(Region { x: 0, y: 0, w: 0, h: 0 }),
+        anchor: Cell::new(None),
+        hook: Cell::new(null_mut()),
+        job_id: Cell::new(0),
+        live: Cell::new(false),
+        patches: RefCell::new(Vec::new()),
+    };
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// For the calls that take no length and read up to a NUL.
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
+fn lparam_xy(l: LPARAM) -> (i32, i32) {
+    ((l & 0xFFFF) as u16 as i16 as i32, ((l >> 16) & 0xFFFF) as u16 as i16 as i32)
+}
+
+/// The model leaves memory, and a job that is running would only load it again.
+pub fn unload_now() {
+    stop();
+    request_unload();
+}
+
+fn stop() {
+    set_job(None);
+    UI.with(|ui| unsafe {
+        ui.live.set(false);
+        ui.job_id.set(0);
+        ui.flashing.set(false);
+        ui.peeking.set(false);
+        ui.patches.borrow_mut().clear();
+        ShowWindow(ui.overlay.get(), SW_HIDE);
+        ShowWindow(ui.frame.get(), SW_HIDE);
+        if !ui.hook.get().is_null() {
+            UnhookWinEvent(ui.hook.replace(null_mut()));
+        }
+    });
+}
+
+/// Shows the frame around the region, or hides it, as the job and the settings have it.
+pub fn update_frame() {
+    UI.with(|ui| unsafe {
+        let frame = ui.frame.get();
+        let config = config::get();
+        let flashing = ui.flashing.get();
+        let selecting = ui.selecting.get();
+        let wanted = selecting.is_some() || ui.job_id.get() != 0 && !PAUSED.load(Ordering::Relaxed) && (config.show_frame || flashing);
+        let region = selecting.unwrap_or(ui.region.get());
+        if !wanted || region.w <= 0 || region.h <= 0 {
+            ShowWindow(frame, SW_HIDE);
+            return;
+        }
+        let t = (if flashing { FLASH_PX } else { FRAME_PX }) * GetDpiForWindow(frame) as i32 / 96;
+        let outer = RECT { left: region.x - t, top: region.y - t, right: region.x + region.w + t, bottom: region.y + region.h + t };
+        let r = frame_rect(region, outer, on_its_monitor(&outer));
+        SetWindowPos(frame, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(frame, null(), 0);
+        UpdateWindow(frame); // a drag resizes it on every move
+    });
+}
+
+/// `visible` is the part of `outer` its monitor shows. A maximised window has no outside, so the
+/// frame comes in over its edge; a region across monitors keeps the whole frame.
+fn frame_rect(region: Region, outer: RECT, visible: RECT) -> RECT {
+    let fits = visible.left <= region.x && visible.top <= region.y && visible.right >= region.x + region.w && visible.bottom >= region.y + region.h;
+    if fits { visible } else { outer }
+}
+
+unsafe fn paint_frame(hwnd: HWND) {
+    unsafe {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut r: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut r);
+        let flashing = UI.with(|ui| ui.flashing.get());
+        let t = (if flashing { FLASH_PX } else { FRAME_PX }) * GetDpiForWindow(hwnd) as i32 / 96;
+        let color = if flashing { FLASH_COLOR } else { FRAME_COLOR };
+        fill(hdc, &r, KEY_COLOR);
+        let mut corner: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut corner);
+        let selecting = UI.with(|ui| ui.selecting.get().is_some());
+        let parts = if selecting { Vec::new() } else { PARTS.lock().unwrap().clone() };
+        let around = |p: &Part| {
+            let p = p.region;
+            RECT { left: p.x - t - corner.left, top: p.y - t - corner.top, right: p.x + p.w + t - corner.left, bottom: p.y + p.h + t - corner.top }
+        };
+        let boxes = if parts.is_empty() { vec![r] } else { parts.iter().map(around).collect() };
+        for b in boxes {
+            fill(hdc, &RECT { bottom: b.top + t, ..b }, color);
+            fill(hdc, &RECT { top: b.bottom - t, ..b }, color);
+            fill(hdc, &RECT { right: b.left + t, ..b }, color);
+            fill(hdc, &RECT { left: b.right - t, ..b }, color);
+        }
+        EndPaint(hwnd, &ps);
+    }
+}
+
+unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_PAINT => {
+                paint_frame(hwnd);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+}
+
+fn frame_bounds(window: HWND) -> Option<RECT> {
+    unsafe {
+        let mut bounds: RECT = std::mem::zeroed();
+        let size = size_of::<RECT>() as u32;
+        let ok = DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS as u32, &mut bounds as *mut _ as *mut _, size) == 0;
+        ok.then_some(bounds)
+    }
+}
+
+/// `bounds` cut to the monitor it mostly sits on: a window can hang off the edge.
+fn on_its_monitor(bounds: &RECT) -> RECT {
+    unsafe {
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(MonitorFromRect(bounds, MONITOR_DEFAULTTONEAREST), &mut info);
+        let mut visible: RECT = std::mem::zeroed();
+        IntersectRect(&mut visible, bounds, &info.rcMonitor);
+        visible
+    }
+}
+
+fn anchored_region(anchor: Anchor, size: Region) -> Option<Region> {
+    let bounds = frame_bounds(anchor.window)?;
+    if anchor.whole {
+        let r = on_its_monitor(&bounds);
+        return Some(Region { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top });
+    }
+    Some(Region { x: bounds.left + anchor.dx, y: bounds.top + anchor.dy, ..size })
+}
+
+/// The window moved: the overlay goes with it at once, which needs no OCR. A new size means new
+/// content, so the old text comes off and the watcher takes the job from there.
+unsafe extern "system" fn on_location(_: HWINEVENTHOOK, _: u32, window: HWND, object: i32, child: i32, _: u32, _: u32) {
+    if object != OBJID_WINDOW || child != 0 {
+        return;
+    }
+    UI.with(|ui| unsafe {
+        let Some(anchor) = ui.anchor.get().filter(|a| a.window == window) else { return };
+        let overlay = ui.overlay.get();
+        let minimised = IsIconic(window) != 0;
+        PAUSED.store(minimised, Ordering::Relaxed);
+        if minimised {
+            ShowWindow(overlay, SW_HIDE);
+            update_frame();
+            return;
+        }
+        let old = ui.region.get();
+        let Some(new) = anchored_region(anchor, old) else { return };
+        *MOVED_AT.lock().unwrap() = Some(Instant::now());
+        if new != old {
+            ui.region.set(new);
+            if let Some(job) = JOB.lock().unwrap().as_mut().filter(|job| job.id == ui.job_id.get()) {
+                job.region = new;
+            }
+            let resized = (new.w, new.h) != (old.w, old.h);
+            if resized {
+                ShowWindow(overlay, SW_HIDE);
+                ui.patches.borrow_mut().clear();
+            } else {
+                SetWindowPos(overlay, null_mut(), new.x, new.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        if !ui.patches.borrow().is_empty() {
+            ShowWindow(overlay, SW_SHOWNOACTIVATE);
+        }
+        update_frame();
+    });
+}
+
+// --- Selection layer
+
+unsafe fn begin_select(live: bool) {
+    if !config::get().license_accepted {
+        return settings_window::open(); // which asks
+    }
+    UI.with(|ui| unsafe {
+        if !ui.select.get().is_null() {
+            // The hotkey again, instead of a drag: the same region as last time. For what is
+            // already live that can only mean enough of it.
+            let keep_live = live || bar::live();
+            end_select();
+            if live && ui.live.get() {
+                return stop();
+            }
+            let region = ui.region.get();
+            // The window may have gone since: what is left is the place on the screen.
+            ui.anchor.set(ui.anchor.get().filter(|a| !window_is_gone(a.window as usize) && IsIconic(a.window) == 0));
+            let followed = ui.anchor.get().and_then(|anchor| anchored_region(anchor, region));
+            if region.w > 0 {
+                start_job(followed.unwrap_or(region), keep_live);
+            }
+            return;
+        }
+        request_load(); // ready by the time the drag ends
+        let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
+        let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        let select = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            w!("SonobaSelect"),
+            null(),
+            WS_POPUP,
+            vx,
+            vy,
+            vw,
+            vh,
+            null_mut(),
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        SetLayeredWindowAttributes(select, KEY_COLOR, DIM_ALPHA, LWA_ALPHA | LWA_COLORKEY);
+        SetWindowDisplayAffinity(select, WDA_EXCLUDEFROMCAPTURE); // the first frame may race its removal
+        ui.select.set(select);
+        ui.drag_from.set(None);
+        ui.hover.set(None);
+        RegisterHotKey(ui.main.get(), HK_ESC, 0, VK_ESCAPE as u32);
+        ShowWindow(select, SW_SHOWNOACTIVATE);
+        update_hover(select);
+        bar::show(live, ui.job_id.get() != 0);
+    });
+}
+
+/// The frontmost window at the point, below the selection layer, and its bounds.
+unsafe fn window_at(select: HWND, at: POINT) -> Option<(HWND, RECT)> {
+    unsafe {
+        let mut hwnd = GetWindow(select, GW_HWNDNEXT);
+        while !hwnd.is_null() {
+            let click_through = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT != 0;
+            let mut cloaked: u32 = 0;
+            DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as *mut _, 4);
+            if IsWindowVisible(hwnd) != 0 && !click_through && cloaked == 0 {
+                if let Some(bounds) = frame_bounds(hwnd).filter(|bounds| PtInRect(bounds, at) != 0) {
+                    return Some((hwnd, bounds));
+                }
+            }
+            hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+        }
+        None
+    }
+}
+
+/// A click with no drag selects the window under it, so that window gets a frame.
+unsafe fn update_hover(select: HWND) {
+    UI.with(|ui| unsafe {
+        let (mut at, mut origin) = (POINT { x: 0, y: 0 }, POINT { x: 0, y: 0 });
+        GetCursorPos(&mut at);
+        ClientToScreen(select, &mut origin);
+        let found = window_at(select, at);
+        ui.hover_window.set(found.map_or(null_mut(), |(window, _)| window));
+        let visible = found.map(|(_, bounds)| on_its_monitor(&bounds));
+        let new = visible.map(|r| (r.left - origin.x, r.top - origin.y, r.right - origin.x, r.bottom - origin.y));
+        let old = ui.hover.replace(new);
+        if old != new {
+            for (left, top, right, bottom) in [old, new].into_iter().flatten() {
+                InvalidateRect(select, &RECT { left, top, right, bottom }, 0);
+            }
+        }
+    });
+}
+
+unsafe fn end_select() {
+    UI.with(|ui| unsafe {
+        UnregisterHotKey(ui.main.get(), HK_ESC);
+        let select = ui.select.replace(null_mut());
+        if !select.is_null() {
+            ReleaseCapture();
+            DestroyWindow(select);
+            bar::hide();
+        }
+        ui.selecting.set(None);
+        update_frame();
+    });
+}
+
+fn selection_rect(from: (i32, i32), to: (i32, i32)) -> RECT {
+    RECT { left: from.0.min(to.0), top: from.1.min(to.1), right: from.0.max(to.0), bottom: from.1.max(to.1) }
+}
+
+unsafe fn finish_select(hwnd: HWND) {
+    UI.with(|ui| unsafe {
+        let Some(from) = ui.drag_from.take() else { return };
+        let mut rect = selection_rect(from, ui.drag_to.get());
+        let mut origin = POINT { x: 0, y: 0 };
+        ClientToScreen(hwnd, &mut origin);
+        let live = bar::live();
+        // Shift adds to what is running. A job with several regions stays where it is on screen.
+        let adding = (ui.shift_seen.get() || shift_down()) && ui.job_id.get() != 0;
+        let clicked = is_small(&rect);
+        let mut anchor = None;
+        if clicked {
+            let Some((left, top, right, bottom)) = ui.hover.get() else { return end_select() };
+            rect = RECT { left, top, right, bottom };
+            anchor = Some(Anchor { window: ui.hover_window.get(), whole: true, dx: 0, dy: 0 });
+        } else {
+            // A part of one window moves with that window; a region across several stays put.
+            let centre = POINT { x: (rect.left + rect.right) / 2 + origin.x, y: (rect.top + rect.bottom) / 2 + origin.y };
+            if let Some((window, bounds)) = window_at(hwnd, centre) {
+                let inside = rect.left + origin.x >= bounds.left
+                    && rect.top + origin.y >= bounds.top
+                    && rect.right + origin.x <= bounds.right
+                    && rect.bottom + origin.y <= bounds.bottom;
+                if inside {
+                    anchor = Some(Anchor { window, whole: false, dx: rect.left + origin.x - bounds.left, dy: rect.top + origin.y - bounds.top });
+                }
+            }
+        }
+        end_select();
+        let region = Region {
+            x: rect.left + origin.x,
+            y: rect.top + origin.y,
+            w: rect.right - rect.left,
+            h: rect.bottom - rect.top,
+        };
+        if adding {
+            let mut parts = PARTS.lock().unwrap().clone();
+            if parts.is_empty() {
+                parts.push(Part { region: ui.region.get(), live: ui.live.get() });
+            }
+            parts.push(Part { region, live });
+            let around = around_all(&parts);
+            *PARTS.lock().unwrap() = parts;
+            ui.anchor.set(None);
+            start_job(around, live);
+        } else {
+            PARTS.lock().unwrap().clear();
+            ui.anchor.set(anchor);
+            start_job(region, live);
+        }
+    });
+}
+
+/// Shift counts if it was down at any point of the drag: fingers rarely leave it and the mouse
+/// button at the same moment, and the state of the key is only ever the state right now.
+fn shift_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_SHIFT as i32) < 0 }
+}
+
+
+fn is_small(rect: &RECT) -> bool {
+    rect.right - rect.left < MIN_SELECTION || rect.bottom - rect.top < MIN_SELECTION
+}
+
+fn start_job(region: Region, live: bool) {
+    stop();
+    UI.with(|ui| unsafe {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let anchor = ui.anchor.get();
+        ui.region.set(region);
+        ui.job_id.set(id);
+        // With several regions the job runs as live, and keep_parts holds the one-shot ones still.
+        let parts = PARTS.lock().unwrap().clone();
+        let live_now = if parts.is_empty() { live } else { parts.iter().any(|p| p.live) };
+        let live = live || !parts.is_empty();
+        ui.live.set(live_now);
+        PAUSED.store(false, Ordering::Relaxed);
+        if let Some(anchor) = anchor {
+            let mut process = 0;
+            let thread = GetWindowThreadProcessId(anchor.window, &mut process);
+            ui.hook.set(SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, null_mut(), Some(on_location), process, thread, WINEVENT_OUTOFCONTEXT));
+        }
+        show_patches(vec![Patch::status(&t(WORKING), region.w)]);
+        set_job(Some(Job { region, live, id, window: anchor.map_or(0, |a| a.window as usize) }));
+        update_frame();
+    });
+}
+
+unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+            WM_ERASEBKGND => 1,
+            WM_PAINT => {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                FillRect(hdc, &ps.rcPaint, GetStockObject(BLACK_BRUSH));
+                let (from, to, hover) = UI.with(|ui| (ui.drag_from.get(), ui.drag_to.get(), ui.hover.get()));
+                let dragged = from.map(|from| selection_rect(from, to)).filter(|rect| !is_small(rect));
+                match (dragged, hover) {
+                    (Some(rect), _) => fill(hdc, &rect, KEY_COLOR),
+                    // A frame, not a clear area: clicks fall straight through the key colour.
+                    (None, Some((left, top, right, bottom))) => {
+                        let t = HOVER_FRAME;
+                        fill(hdc, &RECT { left, top, right, bottom: top + t }, HOVER_COLOR);
+                        fill(hdc, &RECT { left, top: bottom - t, right, bottom }, HOVER_COLOR);
+                        fill(hdc, &RECT { left, top, right: left + t, bottom }, HOVER_COLOR);
+                        fill(hdc, &RECT { left: right - t, top, right, bottom }, HOVER_COLOR);
+                    }
+                    (None, None) => {}
+                }
+                EndPaint(hwnd, &ps);
+                0
+            }
+            WM_LBUTTONDOWN => {
+                let at = lparam_xy(l);
+                UI.with(|ui| {
+                    ui.drag_from.set(Some(at));
+                    ui.drag_to.set(at);
+                    ui.shift_seen.set(shift_down());
+                });
+                SetCapture(hwnd);
+                0
+            }
+            WM_MOUSEMOVE => {
+                let at = lparam_xy(l);
+                let dragging = UI.with(|ui| {
+                    ui.drag_from.get().inspect(|&from| {
+                        ui.shift_seen.set(ui.shift_seen.get() || shift_down());
+                        let old = selection_rect(from, ui.drag_to.replace(at));
+                        if let Some((left, top, right, bottom)) = ui.hover.get().filter(|_| !is_small(&selection_rect(from, at))) {
+                            InvalidateRect(hwnd, &RECT { left, top, right, bottom }, 0);
+                        }
+                        InvalidateRect(hwnd, &old, 0);
+                        InvalidateRect(hwnd, &selection_rect(from, at), 0);
+                        let rect = selection_rect(from, at);
+                        let mut origin = POINT { x: 0, y: 0 };
+                        ClientToScreen(hwnd, &mut origin);
+                        ui.selecting.set((!is_small(&rect)).then(|| Region { x: rect.left + origin.x, y: rect.top + origin.y, w: rect.right - rect.left, h: rect.bottom - rect.top }));
+                    })
+                });
+                if dragging.is_some() {
+                    update_frame();
+                }
+                if dragging.is_none() {
+                    update_hover(hwnd);
+                }
+                0
+            }
+            WM_LBUTTONUP => {
+                UI.with(|ui| ui.drag_to.set(lparam_xy(l)));
+                finish_select(hwnd);
+                0
+            }
+            // On the way up: the layer gone, the release would open the menu of the app below.
+            WM_RBUTTONUP => {
+                end_select();
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+}
+
+// --- Overlay: everything is the see-through key colour except the patches
+
+unsafe fn text_font(px: i32, bold: bool) -> HFONT {
+    let config = config::get();
+    let face = wide_z(if config.font.is_empty() { DEFAULT_FONT } else { &config.font });
+    unsafe {
+        CreateFontW(
+            -px,
+            0,
+            0,
+            0,
+            if bold || config.bold_text { FW_BOLD } else { FW_NORMAL } as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            DEFAULT_PITCH as u32,
+            face.as_ptr(),
+        )
+    }
+}
+
+const TEXT_FLAGS: DRAW_TEXT_FORMAT = DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL;
+
+/// Lays one patch out with GDI's measure of its text: see Patch::fit.
+unsafe fn fit(hdc: HDC, patch: &mut Patch, status_px: i32) {
+    let text = wide(&patch.text);
+    let bold = patch.bold;
+    patch.fit(status_px, |px: i32, width: i32| unsafe {
+        let font = text_font(px, bold);
+        let old = SelectObject(hdc, font);
+        let mut rect = RECT { left: 0, top: 0, right: width, bottom: 0 };
+        DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut rect, TEXT_FLAGS | DT_CALCRECT);
+        SelectObject(hdc, old);
+        DeleteObject(font);
+        (rect.right, rect.bottom)
+    });
+}
+
+/// Lays the patches out and shows them over the region. No patches hides the overlay.
+fn show_patches(mut patches: Vec<Patch>) {
+    UI.with(|ui| unsafe {
+        let overlay = ui.overlay.get();
+        if patches.is_empty() {
+            ShowWindow(overlay, SW_HIDE);
+            ui.patches.borrow_mut().clear();
+            return;
+        }
+        let region = ui.region.get();
+        SetWindowPos(overlay, null_mut(), region.x, region.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        let status_px = STATUS_PX * GetDpiForWindow(overlay) as i32 / 96; // after the move: per monitor
+        let hdc = GetDC(overlay);
+        for patch in &mut patches {
+            fit(hdc, patch, status_px);
+        }
+        ReleaseDC(overlay, hdc);
+
+        let height = patches.iter().map(|p| p.y + p.h).max().unwrap_or(0).max(region.h);
+        let text = patches.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
+        SetWindowTextW(overlay, wide_z(&text).as_ptr()); // keeps it readable by screen readers
+        *ui.patches.borrow_mut() = patches;
+        // Behind a minimised window the result waits for it to come back.
+        let show = if PAUSED.load(Ordering::Relaxed) || ui.peeking.get() { 0 } else { SWP_SHOWWINDOW };
+        SetWindowPos(overlay, HWND_TOPMOST, region.x, region.y, region.w, height, SWP_NOACTIVATE | show);
+        InvalidateRect(overlay, null(), 0);
+    });
+}
+
+/// Applies the font and strength from the settings to what is on show.
+pub fn look_changed() {
+    UI.with(|ui| unsafe {
+        SetLayeredWindowAttributes(ui.overlay.get(), KEY_COLOR, (config::get().opacity as u32 * 255 / 100) as u8, LWA_COLORKEY | LWA_ALPHA);
+        let patches = ui.patches.borrow().clone();
+        if !patches.is_empty() {
+            show_patches(patches);
+        }
+    });
+}
+
+/// The original comes back for as long as the key is held.
+fn peek_start() {
+    UI.with(|ui| unsafe {
+        if ui.job_id.get() == 0 {
+            return;
+        }
+        ui.peeking.set(true);
+        ShowWindow(ui.overlay.get(), SW_HIDE);
+        if !config::get().hotkeys[3].is_mouse() {
+            SetTimer(ui.main.get(), PEEK_TIMER, PEEK_MS, None);
+        }
+    });
+}
+
+fn peek_end() {
+    UI.with(|ui| unsafe {
+        KillTimer(ui.main.get(), PEEK_TIMER);
+        if ui.peeking.replace(false) && !ui.patches.borrow().is_empty() && !PAUSED.load(Ordering::Relaxed) {
+            ShowWindow(ui.overlay.get(), SW_SHOWNOACTIVATE);
+        }
+    });
+}
+
+pub fn copy_to_clipboard(text: &str) -> bool {
+    let units: Vec<u16> = wide_z(text);
+    UI.with(|ui| unsafe {
+        // Other apps open the clipboard for a moment whenever it changes.
+        let opened = (0..CLIPBOARD_TRIES).any(|_| {
+            let opened = OpenClipboard(ui.main.get()) != 0;
+            if !opened {
+                std::thread::sleep(CLIPBOARD_WAIT);
+            }
+            opened
+        });
+        if !opened {
+            return false;
+        }
+        EmptyClipboard();
+        let memory = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2);
+        let target = GlobalLock(memory) as *mut u16;
+        let copied = !target.is_null();
+        if copied {
+            std::ptr::copy_nonoverlapping(units.as_ptr(), target, units.len());
+            GlobalUnlock(memory);
+            SetClipboardData(CF_UNICODETEXT as u32, memory as HANDLE);
+        }
+        CloseClipboard();
+        copied
+    })
+}
+
+/// Says how it went beside the cursor: nothing else on screen changes.
+fn copy_translation() {
+    let text = UI.with(|ui| ui.patches.borrow().iter().filter(|p| !p.source.is_empty()).map(|p| p.text.clone()).collect::<Vec<_>>().join("\n"));
+    let result = if text.is_empty() {
+        "コピーする訳文がありません"
+    } else if copy_to_clipboard(&text) {
+        "訳文をコピーしました"
+    } else {
+        "クリップボードが使えません"
+    };
+    toast::show(&t(result));
+}
+
+/// Stops everything for a while, keys included, for when they clash with what is on screen. A
+/// live job picks up again afterwards.
+fn toggle_pause() {
+    let pausing = !SUSPENDED.fetch_xor(true, Ordering::Relaxed);
+    UI.with(|ui| unsafe {
+        if pausing {
+            end_select();
+            ui.resume.set(ui.live.get().then(|| ui.region.get()));
+            stop();
+            pause_hotkeys();
+        } else {
+            register_hotkeys();
+            if let Some(region) = ui.resume.take() {
+                start_job(region, true);
+            }
+        }
+        tray_icon(ui.main.get(), NIM_MODIFY);
+    });
+}
+
+unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        if code == HC_ACTION as i32 {
+            let side = |data: &MSLLHOOKSTRUCT| if (data.mouseData >> 16) as u16 == XBUTTON1 { VK_XBUTTON1 } else { VK_XBUTTON2 };
+            let data = &*(l as *const MSLLHOOKSTRUCT);
+            let event = match w as u32 {
+                WM_MBUTTONDOWN => Some((VK_MBUTTON, true)),
+                WM_MBUTTONUP => Some((VK_MBUTTON, false)),
+                WM_XBUTTONDOWN => Some((side(data), true)),
+                WM_XBUTTONUP => Some((side(data), false)),
+                _ => None,
+            };
+            if let Some((button, down)) = event {
+                let held = |key: VIRTUAL_KEY, flag: u32| if GetAsyncKeyState(key as i32) < 0 { flag } else { 0 };
+                let mods = held(VK_MENU, MOD_ALT) | held(VK_CONTROL, MOD_CONTROL) | held(VK_SHIFT, MOD_SHIFT);
+                let keys = MOUSE_KEYS.lock().unwrap();
+                // The release counts whatever the modifiers do meanwhile: it must not reach the app.
+                let found = keys.iter().find(|(_, h)| h.key == button as u32 && (!down || h.mods == mods));
+                if let Some((id, _)) = found {
+                    let main = UI.with(|ui| ui.main.get());
+                    if down {
+                        PostMessageW(main, WM_HOTKEY, *id as usize, 0);
+                    } else if *id == HK_PEEK {
+                        PostMessageW(main, WM_PEEK_END, 0, 0);
+                    }
+                    return 1;
+                }
+            }
+        }
+        CallNextHookEx(null_mut(), code, w, l)
+    }
+}
+
+/// The hook exists only while a mouse button is in use, and it only looks at those buttons.
+fn set_mouse_keys(keys: Vec<(i32, config::Hotkey)>) {
+    UI.with(|ui| unsafe {
+        let wanted = !keys.is_empty();
+        *MOUSE_KEYS.lock().unwrap() = keys;
+        if wanted && ui.mouse_hook.get().is_null() {
+            ui.mouse_hook.set(SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), GetModuleHandleW(null()), 0));
+        } else if !wanted && !ui.mouse_hook.get().is_null() {
+            UnhookWindowsHookEx(ui.mouse_hook.replace(null_mut()));
+        }
+    });
+}
+
+unsafe fn fill(hdc: HDC, rect: &RECT, color: u32) {
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        FillRect(hdc, rect, brush);
+        DeleteObject(brush);
+    }
+}
+
+unsafe fn draw_backdrop(hdc: HDC, p: &Patch, b: &Backdrop) {
+    unsafe {
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = b.w;
+        info.bmiHeader.biHeight = -b.h; // top-down rows
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        SetDIBitsToDevice(hdc, p.x, p.y, b.w as u32, b.h as u32, 0, 0, 0, b.h as u32, b.bgra.as_ptr() as *const _, &info, DIB_RGB_COLORS);
+    }
+}
+
+unsafe fn draw_patches(hdc: HDC, patches: &[Patch]) {
+    unsafe {
+        SetBkMode(hdc, TRANSPARENT as i32);
+        for p in patches {
+            match &p.backdrop {
+                Some(b) => draw_backdrop(hdc, p, b),
+                None => fill(hdc, &RECT { left: p.x, top: p.y, right: p.x + p.w, bottom: p.y + p.h }, p.bg),
+            }
+        }
+        // A second pass, so no patch can paint over the text of the one before it.
+        for p in patches {
+            let font = text_font(p.px, p.bold);
+            let old_font = SelectObject(hdc, font);
+            let top = p.y + (p.h - p.text_h) / 2;
+            // DT_EDITCONTROL drops a last line that overhangs, so the box must hold all of it.
+            let area = RECT { left: p.x, top, right: p.x + p.w, bottom: top + p.text_h };
+            let text = wide(&p.text);
+            let write = |dx: i32, dy: i32, color: u32| {
+                let mut at = RECT { left: area.left + dx, top: area.top + dy, right: area.right + dx, bottom: area.bottom + dy };
+                SetTextColor(hdc, color);
+                DrawTextW(hdc, text.as_ptr(), text.len() as i32, &mut at, TEXT_FLAGS);
+            };
+            if p.backdrop.is_some() {
+                let reach = (p.px / OUTLINE_EVERY_PX).max(1);
+                let outline = patch::outline_color(p.fg);
+                for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                    write(dx * reach, dy * reach, outline);
+                }
+            }
+            write(0, 0, p.fg);
+            SelectObject(hdc, old_font);
+            DeleteObject(font);
+        }
+    }
+}
+
+unsafe fn paint_overlay(hwnd: HWND) {
+    unsafe {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut client);
+        // Off screen first: drawing straight to the window would flash the original through.
+        let mem = CreateCompatibleDC(hdc);
+        let bitmap = CreateCompatibleBitmap(hdc, client.right, client.bottom);
+        let old_bitmap = SelectObject(mem, bitmap);
+        fill(mem, &client, KEY_COLOR);
+        UI.with(|ui| draw_patches(mem, &ui.patches.borrow()));
+        BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+    }
+}
+
+unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_PAINT => {
+                paint_overlay(hwnd);
+                0
+            }
+            WM_JOB_OVER => {
+                if UI.with(|ui| ui.job_id.get()) == w as u64 {
+                    stop();
+                }
+                0
+            }
+            WM_PARTS => {
+                if UI.with(|ui| ui.job_id.get()) == w as u64 {
+                    let live = PARTS.lock().unwrap().iter().any(|p| p.live);
+                    UI.with(|ui| {
+                        ui.live.set(live);
+                        InvalidateRect(ui.frame.get(), null(), 0);
+                    });
+                }
+                0
+            }
+            WM_TRANSLATED => {
+                if UI.with(|ui| ui.job_id.get()) == w as u64 && config::get().flash_frame {
+                    UI.with(|ui| {
+                        ui.flashing.set(true);
+                        SetTimer(ui.main.get(), FLASH_TIMER, FLASH_MS, None);
+                    });
+                    update_frame();
+                }
+                0
+            }
+            WM_PATCHES => {
+                let patches = Box::from_raw(l as *mut Vec<Patch>);
+                if UI.with(|ui| ui.job_id.get()) == w as u64 {
+                    show_patches(*patches);
+                }
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+}
+
+// --- Hidden main window: hotkeys and tray
+
+unsafe fn tray_menu(hwnd: HWND) {
+    unsafe {
+        let menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, wide_z(&t("設定")).as_ptr());
+        let paused = if SUSPENDED.load(Ordering::Relaxed) { MF_CHECKED } else { 0 };
+        AppendMenuW(menu, MF_STRING | paused, MENU_PAUSE, wide_z(&t("一時停止")).as_ptr());
+        AppendMenuW(menu, MF_STRING, MENU_EXIT, wide_z(&t("終了")).as_ptr());
+        let mut at = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut at);
+        SetForegroundWindow(hwnd); // Windows only dismisses a tray menu properly this way
+        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, at.x, at.y, 0, hwnd, null());
+        DestroyMenu(menu);
+        match chosen as usize {
+            MENU_SETTINGS => settings_window::open(),
+            MENU_PAUSE => toggle_pause(),
+            MENU_EXIT => {
+                DestroyWindow(hwnd);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The icon in app.res, at the size given or Windows' size for a tray icon.
+pub fn app_icon(size: Option<i32>) -> HICON {
+    unsafe {
+        let side = size.unwrap_or_else(|| GetSystemMetrics(SM_CXSMICON));
+        LoadImageW(GetModuleHandleW(null()), 1 as *const u16, IMAGE_ICON, side, side, LR_DEFAULTCOLOR) as HICON
+    }
+}
+
+/// The tray's text follows the language. The rest is written when next shown.
+pub fn language_changed() {
+    UI.with(|ui| unsafe { tray_icon(ui.main.get(), NIM_MODIFY) });
+}
+
+unsafe fn tray_icon(hwnd: HWND, action: u32) {
+    unsafe {
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = hwnd;
+        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        data.uCallbackMessage = WM_TRAY;
+        data.hIcon = app_icon(None);
+        let state = if SUSPENDED.load(Ordering::Relaxed) { "一時停止中" } else { "ダブルクリックで設定を開きます" };
+        let tip = wide(&format!("Sonoba\n{}", t(state)));
+        data.szTip[..tip.len()].copy_from_slice(&tip);
+        Shell_NotifyIconW(action, &data);
+    }
+}
+
+unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_HOTKEY => {
+                match w as i32 {
+                    HK_ONCE => begin_select(false),
+                    HK_LIVE => begin_select(true),
+                    HK_STOP => {
+                        end_select();
+                        stop();
+                    }
+                    HK_ESC => end_select(),
+                    HK_PEEK => peek_start(),
+                    HK_COPY => copy_translation(),
+                    _ => {}
+                }
+                0
+            }
+            WM_PEEK_END => {
+                peek_end();
+                0
+            }
+            WM_TIMER if w == PEEK_TIMER => {
+                if GetAsyncKeyState(config::get().hotkeys[3].key as i32) >= 0 {
+                    peek_end();
+                }
+                0
+            }
+            WM_TIMER if w == FLASH_TIMER => {
+                KillTimer(hwnd, FLASH_TIMER);
+                UI.with(|ui| ui.flashing.set(false));
+                update_frame();
+                0
+            }
+            WM_DISPLAYCHANGE => {
+                stop(); // the region may no longer be where it was
+                0
+            }
+            WM_TRAY => {
+                match l as u32 {
+                    WM_RBUTTONUP => tray_menu(hwnd),
+                    WM_LBUTTONDBLCLK => settings_window::open(),
+                    _ => {}
+                }
+                0
+            }
+            WM_DESTROY => {
+                tray_icon(hwnd, NIM_DELETE);
+                PostQuitMessage(0);
+                0
+            }
+            // Explorer restarted and lost every tray icon.
+            _ if msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+                tray_icon(hwnd, NIM_ADD);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+}
+
+/// Registers the saved hotkeys. Returns false if another app holds one of them.
+fn register_hotkeys() -> bool {
+    if SUSPENDED.load(Ordering::Relaxed) {
+        return true;
+    }
+    let main = UI.with(|ui| ui.main.get());
+    let hotkeys = config::get().hotkeys;
+    let mut mouse = Vec::new();
+    let mut taken = Vec::new();
+    for (index, (id, hotkey)) in ACTIONS.into_iter().zip(hotkeys).enumerate() {
+        if hotkey == config::Hotkey::OFF {
+            continue;
+        }
+        if hotkey.is_mouse() {
+            mouse.push((id, hotkey));
+        } else if unsafe { RegisterHotKey(main, id, hotkey.mods | MOD_NOREPEAT, hotkey.key) } == 0 {
+            taken.push(index);
+        }
+    }
+    set_mouse_keys(mouse);
+    // The extras are conveniences: one that is taken shows in the settings and stops nothing.
+    let all = !taken.iter().any(|&index| index < ESSENTIAL_ACTIONS);
+    *TAKEN_KEYS.lock().unwrap() = taken;
+    all
+}
+
+/// Choosing a key in the settings needs the keys free, so that they can be typed.
+pub fn pause_hotkeys() {
+    let main = UI.with(|ui| ui.main.get());
+    for id in ACTIONS {
+        unsafe { UnregisterHotKey(main, id) };
+    }
+    set_mouse_keys(Vec::new());
+}
+
+pub fn resume_hotkeys() {
+    pause_hotkeys(); // registering a key twice would look like another app holding it
+    register_hotkeys();
+}
+
+/// True if the key combination is free for the taking.
+pub fn try_hotkeys(hotkey: config::Hotkey) -> bool {
+    let main = UI.with(|ui| ui.main.get());
+    hotkey.is_mouse() || unsafe {
+        let free = RegisterHotKey(main, HK_PROBE, hotkey.mods, hotkey.key) != 0;
+        UnregisterHotKey(main, HK_PROBE);
+        free
+    }
+}
+
+unsafe fn register_class(name: *const u16, proc: WNDPROC, cursor: *const u16) {
+    unsafe {
+        let mut class: WNDCLASSEXW = std::mem::zeroed();
+        class.cbSize = size_of::<WNDCLASSEXW>() as u32;
+        class.lpfnWndProc = proc;
+        class.hInstance = GetModuleHandleW(null());
+        class.lpszClassName = name;
+        class.hCursor = LoadCursorW(null_mut(), cursor);
+        RegisterClassExW(&class);
+    }
+}
+
+/// A second start opens the settings of the first, which is usually what was wanted.
+fn already_running() -> bool {
+    unsafe {
+        CreateMutexW(null(), 0, w!("Sonoba.single-instance"));
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return false;
+        }
+        let first = FindWindowW(w!("SonobaMain"), null());
+        PostMessageW(first, WM_TRAY, 0, WM_LBUTTONDBLCLK as isize);
+        true
+    }
+}
+
+pub fn main() {
+    crate::log_panics();
+    if already_running() {
+        return;
+    }
+    settings_window::carry_over_autostart();
+    unsafe {
+        CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32); // WebView2 asks for it
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        register_class(w!("SonobaMain"), Some(main_proc), IDC_ARROW);
+        register_class(w!("SonobaSelect"), Some(select_proc), IDC_CROSS);
+        register_class(w!("SonobaOverlay"), Some(overlay_proc), IDC_ARROW);
+        register_class(w!("SonobaFrame"), Some(frame_proc), IDC_ARROW);
+        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
+
+        let module = GetModuleHandleW(null());
+        let main = CreateWindowExW(0, w!("SonobaMain"), w!("Sonoba"), 0, 0, 0, 0, 0, null_mut(), null_mut(), module, null());
+        let overlay = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            w!("SonobaOverlay"),
+            null(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            null_mut(),
+            null_mut(),
+            module,
+            null(),
+        );
+        let frame = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            w!("SonobaFrame"),
+            null(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            null_mut(),
+            null_mut(),
+            module,
+            null(),
+        );
+        SetLayeredWindowAttributes(frame, KEY_COLOR, 255, LWA_COLORKEY);
+        SetWindowDisplayAffinity(frame, WDA_EXCLUDEFROMCAPTURE); // it can sit on the region's edge
+        UI.with(|ui| {
+            ui.main.set(main);
+            ui.overlay.set(overlay);
+            ui.frame.set(frame);
+        });
+        look_changed();
+
+        tray_icon(main, NIM_ADD);
+        settings_window::register_class();
+        bar::register_class();
+        toast::register_class();
+        OVERLAY.store(overlay as usize, Ordering::Relaxed);
+        std::thread::spawn(worker);
+        let hotkeys_ok = register_hotkeys();
+        if !hotkeys_ok {
+            let warning = wide_z(&t("ホットキーを登録できません。別のアプリが使っています。設定で変更してください。"));
+            MessageBoxW(null_mut(), warning.as_ptr(), w!("Sonoba"), MB_OK | MB_ICONWARNING);
+        }
+        let config = config::get();
+        if !hotkeys_ok || !config.license_accepted || !models::is_present(&config.model) {
+            settings_window::open();
+        }
+
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_frame_stays_on_the_screen() {
+        let screen = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let around = |x, y, w, h| {
+            let region = Region { x, y, w, h };
+            let outer = RECT { left: x - 2, top: y - 2, right: x + w + 2, bottom: y + h + 2 };
+            let visible = RECT { left: outer.left.max(0), top: outer.top.max(0), right: outer.right.min(1920), bottom: outer.bottom.min(1080) };
+            frame_rect(region, outer, visible)
+        };
+        let r = around(100, 100, 300, 200);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (98, 98, 402, 302));
+        let r = around(0, 0, 1920, 1080);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (screen.left, screen.top, screen.right, screen.bottom));
+        let r = around(1800, 100, 300, 200); // into the next monitor
+        assert_eq!((r.left, r.right), (1798, 2102));
+    }
+
+
+    /// Draws the overlay onto a picture, to judge a layout without touching the real screen:
+    /// RENDER_IN=in.png RENDER_OUT=out.png cargo test render_picture -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs Ollama and a picture"]
+    fn render_picture() {
+        let (input, output) = (std::env::var("RENDER_IN").unwrap(), std::env::var("RENDER_OUT").unwrap());
+        let (mut bgra, w, h) = crate::ocr::png_bgra(&input);
+        let region = Region { x: 0, y: 0, w: w as i32, h: h as i32 };
+        let live = std::env::var("RENDER_LIVE").is_ok(); // live jobs keep the flat box
+        let job = Job { region, live, id: 1, window: 0 };
+        set_job(Some(job));
+        let frame = Frame { pixels: bgra.clone(), w, h };
+        let (mut models, mut translator) = (None, crate::translate::Translator::new());
+        let keep_going = || true;
+        let shared = new_shared();
+        let start = Instant::now();
+        let mut patches = translate_frame(&frame, live, &mut models, &mut translator, &keep_going, &|_| {}, &shared).unwrap();
+        println!("first pass {:?}", start.elapsed());
+        let start = Instant::now();
+        translate_frame(&frame, live, &mut models, &mut translator, &keep_going, &|_| {}, &shared).unwrap();
+        println!("second pass, translations cached {:?}", start.elapsed());
+        unsafe {
+            let mem = CreateCompatibleDC(null_mut());
+            let mut info: BITMAPINFO = std::mem::zeroed();
+            info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = w as i32;
+            info.bmiHeader.biHeight = -(h as i32);
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            let mut bits = null_mut();
+            let dib = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            SelectObject(mem, dib);
+            std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+            for patch in &mut patches {
+                fit(mem, patch, STATUS_PX);
+            }
+            for p in &patches {
+                println!("{},{} {}x{} em={} px={} bold={} {}", p.x, p.y, p.w, p.h, p.em, p.px, p.bold, p.text);
+            }
+            draw_patches(mem, &patches);
+            GdiFlush();
+            std::ptr::copy_nonoverlapping(bits as *const u8, bgra.as_mut_ptr(), bgra.len());
+        }
+        let rgb: Vec<u8> = bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+        let file = std::io::BufWriter::new(std::fs::File::create(output).unwrap());
+        let mut encoder = png::Encoder::new(file, w as u32, h as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&rgb).unwrap();
+    }
+}

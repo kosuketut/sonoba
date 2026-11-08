@@ -4,8 +4,7 @@ use crate::engine::{self, Device, Options};
 use crate::models;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
+use std::sync::Mutex;
 
 const MOD_ALT: u32 = 1;
 const MOD_CONTROL: u32 = 2;
@@ -50,13 +49,6 @@ pub struct Config {
     pub hotkeys: [Hotkey; ACTIONS],
 }
 
-/// Japanese on a Japanese Windows, English on any other.
-fn system_language() -> &'static str {
-    const PRIMARY: u16 = 0x3FF;
-    const JAPANESE: u16 = 0x11;
-    if unsafe { GetUserDefaultUILanguage() } & PRIMARY == JAPANESE { "ja" } else { "en" }
-}
-
 impl Default for Config {
     fn default() -> Self {
         let ctrl_alt = |key: char| Hotkey { mods: MOD_CONTROL | MOD_ALT, key: key as u32 };
@@ -69,7 +61,7 @@ impl Default for Config {
             flash_frame: false,
             source: "auto".to_string(),
             target: "ja".to_string(),
-            ui_lang: system_language().to_string(),
+            ui_lang: crate::platform::system_language().to_string(),
             intro_done: false,
             license_accepted: false,
             form: String::new(),
@@ -175,8 +167,15 @@ impl Config {
 
 /// A copy unpacked from the zip keeps everything in its `data` folder, so that deleting the folder
 /// removes the app. Where it cannot write there (Program Files), the user's profile is used.
+/// A Mac app keeps nothing inside its bundle, which would break its signature.
+#[cfg(not(windows))]
 pub fn portable_dir() -> Option<&'static PathBuf> {
-    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    None
+}
+
+#[cfg(windows)]
+pub fn portable_dir() -> Option<&'static PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
         let dir = std::env::current_exe().ok()?.parent()?.join("data");
         let probe = dir.join(".write-test");
@@ -187,9 +186,17 @@ pub fn portable_dir() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
-/// The app's folder in the user's profile, under the environment variable `root`.
+/// The app's folder in the user's profile, under the environment variable `root`. A Mac has one
+/// place for both kinds, Application Support.
 pub fn profile_dir(root: &str) -> PathBuf {
-    settled_dir(Path::new(&std::env::var_os(root).unwrap_or_default()))
+    #[cfg(windows)]
+    let base = PathBuf::from(std::env::var_os(root).unwrap_or_default());
+    #[cfg(not(windows))]
+    let base = {
+        let _ = root;
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Library/Application Support")
+    };
+    settled_dir(&base)
 }
 
 /// The folder was called screen-translate before the rename to Sonoba. It moves over at the first
@@ -225,6 +232,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn the_old_profile_folder_moves_over_once() {
         use std::os::windows::fs::OpenOptionsExt;
         let root = std::env::temp_dir().join(format!("sonoba-test-{}", std::process::id()));
